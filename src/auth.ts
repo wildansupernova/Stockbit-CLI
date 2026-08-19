@@ -1,6 +1,6 @@
 import { chmod, lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ReadStream, WriteStream } from "node:tty";
 
 import { CliError } from "./errors.js";
@@ -10,7 +10,12 @@ const CONFIG_DIRECTORY_ENVIRONMENT_VARIABLE = "STOCKBIT_CONFIG_DIR";
 const LOCAL_CREDENTIALS_FILENAME = "credentials-stockbit.json";
 
 interface CredentialsFile {
-  bearerToken: string;
+  schemaVersion?: unknown;
+  accessToken?: unknown;
+  refreshToken?: unknown;
+  accessExpiresAt?: unknown;
+  refreshExpiresAt?: unknown;
+  bearerToken?: unknown;
 }
 
 interface CredentialStorageValue {
@@ -19,7 +24,28 @@ interface CredentialStorageValue {
       token?: unknown;
       expired_at?: unknown;
     };
+    refresh?: {
+      token?: unknown;
+      expired_at?: unknown;
+    };
   };
+}
+
+export interface TokenCredentials {
+  accessToken: string;
+  refreshToken?: string;
+  accessExpiresAt?: string;
+  refreshExpiresAt?: string;
+}
+
+type StoredTokenSource = "local-credentials-file" | "credentials-file";
+
+export interface ResolvedCredentials extends TokenCredentials {
+  source:
+    | "command-line"
+    | "environment"
+    | StoredTokenSource;
+  credentialsPath?: string;
 }
 
 export interface ResolvedToken {
@@ -36,12 +62,12 @@ export interface TokenStatus {
   source?: ResolvedToken["source"];
   expiresAt?: string;
   expired?: boolean;
+  refreshConfigured?: boolean;
+  refreshExpiresAt?: string;
+  refreshExpired?: boolean;
 }
 
-export interface ParsedCredentialStorage {
-  token: string;
-  expiresAt?: string;
-}
+export type ParsedCredentialStorage = TokenCredentials;
 
 export interface ResolveTokenOptions {
   bearer?: string | undefined;
@@ -115,6 +141,14 @@ function decodeCredentialStorageValue(value: string): string {
   return decoded;
 }
 
+function normalizedExpiration(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const expiration = new Date(value);
+  return Number.isNaN(expiration.getTime()) ? undefined : expiration.toISOString();
+}
+
 export function parseCredentialStorage(value: string): ParsedCredentialStorage {
   let decoded = decodeCredentialStorageValue(value);
 
@@ -149,25 +183,75 @@ export function parseCredentialStorage(value: string): ParsedCredentialStorage {
   }
 
   const result: ParsedCredentialStorage = {
-    token: normalizeBearerToken(access.token),
+    accessToken: normalizeBearerToken(access.token),
   };
-  if (typeof access.expired_at === "string") {
-    const expiration = new Date(access.expired_at);
-    if (!Number.isNaN(expiration.getTime())) {
-      result.expiresAt = expiration.toISOString();
+  const accessExpiresAt = normalizedExpiration(access.expired_at);
+  if (accessExpiresAt) {
+    result.accessExpiresAt = accessExpiresAt;
+  }
+
+  const refresh = parsed.state?.refresh;
+  if (refresh && typeof refresh.token === "string" && refresh.token.trim()) {
+    result.refreshToken = normalizeBearerToken(refresh.token);
+    const refreshExpiresAt = normalizedExpiration(refresh.expired_at);
+    if (refreshExpiresAt) {
+      result.refreshExpiresAt = refreshExpiresAt;
     }
   }
 
   return result;
 }
 
-async function storedTokenAtPath(path: string): Promise<string | undefined> {
+function normalizeTokenCredentials(credentials: TokenCredentials): TokenCredentials {
+  const normalized: TokenCredentials = {
+    accessToken: normalizeBearerToken(credentials.accessToken),
+  };
+  if (credentials.refreshToken?.trim()) {
+    normalized.refreshToken = normalizeBearerToken(credentials.refreshToken);
+  }
+  const accessExpiresAt = normalizedExpiration(credentials.accessExpiresAt);
+  if (accessExpiresAt) {
+    normalized.accessExpiresAt = accessExpiresAt;
+  }
+  const refreshExpiresAt = normalizedExpiration(credentials.refreshExpiresAt);
+  if (refreshExpiresAt) {
+    normalized.refreshExpiresAt = refreshExpiresAt;
+  }
+  return normalized;
+}
+
+function parseCredentialsFile(credentials: CredentialsFile): TokenCredentials | undefined {
+  const accessToken =
+    typeof credentials.accessToken === "string"
+      ? credentials.accessToken
+      : typeof credentials.bearerToken === "string"
+        ? credentials.bearerToken
+        : undefined;
+  if (!accessToken) {
+    return undefined;
+  }
+
+  return normalizeTokenCredentials({
+    accessToken,
+    ...(typeof credentials.refreshToken === "string"
+      ? { refreshToken: credentials.refreshToken }
+      : {}),
+    ...(typeof credentials.accessExpiresAt === "string"
+      ? { accessExpiresAt: credentials.accessExpiresAt }
+      : {}),
+    ...(typeof credentials.refreshExpiresAt === "string"
+      ? { refreshExpiresAt: credentials.refreshExpiresAt }
+      : {}),
+  });
+}
+
+async function storedCredentialsAtPath(
+  path: string,
+): Promise<TokenCredentials | undefined> {
   try {
     const contents = await readFile(path, "utf8");
-    const credentials = JSON.parse(contents) as Partial<CredentialsFile>;
-    return typeof credentials.bearerToken === "string"
-      ? normalizeBearerToken(credentials.bearerToken)
-      : undefined;
+    const credentials = JSON.parse(contents) as CredentialsFile;
+    return parseCredentialsFile(credentials);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
@@ -185,14 +269,14 @@ async function storedTokenAtPath(path: string): Promise<string | undefined> {
   }
 }
 
-export async function resolveBearerToken(
+export async function resolveCredentials(
   options: ResolveTokenOptions = {},
-): Promise<ResolvedToken> {
+): Promise<ResolvedCredentials> {
   const environment = options.environment ?? process.env;
   const cwd = options.cwd ?? process.cwd();
   if (options.bearer?.trim()) {
     return {
-      token: normalizeBearerToken(options.bearer),
+      accessToken: normalizeBearerToken(options.bearer),
       source: "command-line",
     };
   }
@@ -200,19 +284,29 @@ export async function resolveBearerToken(
   const environmentToken = environment[TOKEN_ENVIRONMENT_VARIABLE]?.trim();
   if (environmentToken) {
     return {
-      token: normalizeBearerToken(environmentToken),
+      accessToken: normalizeBearerToken(environmentToken),
       source: "environment",
     };
   }
 
-  const localToken = await storedTokenAtPath(localCredentialsPath(cwd));
-  if (localToken) {
-    return { token: localToken, source: "local-credentials-file" };
+  const localPath = localCredentialsPath(cwd);
+  const localCredentials = await storedCredentialsAtPath(localPath);
+  if (localCredentials) {
+    return {
+      ...localCredentials,
+      source: "local-credentials-file",
+      credentialsPath: localPath,
+    };
   }
 
-  const globalToken = await storedTokenAtPath(credentialsPath(environment));
-  if (globalToken) {
-    return { token: globalToken, source: "credentials-file" };
+  const globalPath = credentialsPath(environment);
+  const globalCredentials = await storedCredentialsAtPath(globalPath);
+  if (globalCredentials) {
+    return {
+      ...globalCredentials,
+      source: "credentials-file",
+      credentialsPath: globalPath,
+    };
   }
 
   throw new CliError(
@@ -222,32 +316,32 @@ export async function resolveBearerToken(
   );
 }
 
-export async function saveBearerToken(
-  value: string,
-  environment: NodeJS.ProcessEnv = process.env,
-): Promise<string> {
-  const token = normalizeBearerToken(value);
-  const directory = configDirectory(environment);
-  const path = credentialsPath(environment);
-
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
-  await writeFile(path, `${JSON.stringify({ bearerToken: token })}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await chmod(path, 0o600);
-
-  return path;
+export async function resolveBearerToken(
+  options: ResolveTokenOptions = {},
+): Promise<ResolvedToken> {
+  const credentials = await resolveCredentials(options);
+  return {
+    token: credentials.accessToken,
+    source: credentials.source,
+  };
 }
 
-export async function saveLocalBearerToken(
-  value: string,
-  cwd: string = process.cwd(),
-): Promise<string> {
-  const token = normalizeBearerToken(value);
-  const path = localCredentialsPath(cwd);
+function serializedCredentials(credentials: TokenCredentials): string {
+  const normalized = normalizeTokenCredentials(credentials);
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    accessToken: normalized.accessToken,
+    ...(normalized.refreshToken ? { refreshToken: normalized.refreshToken } : {}),
+    ...(normalized.accessExpiresAt
+      ? { accessExpiresAt: normalized.accessExpiresAt }
+      : {}),
+    ...(normalized.refreshExpiresAt
+      ? { refreshExpiresAt: normalized.refreshExpiresAt }
+      : {}),
+  })}\n`;
+}
 
+async function assertSafeCredentialsPath(path: string): Promise<void> {
   try {
     const existing = await lstat(path);
     if (existing.isSymbolicLink()) {
@@ -262,14 +356,75 @@ export async function saveLocalBearerToken(
       throw error;
     }
   }
+}
 
-  await writeFile(path, `${JSON.stringify({ bearerToken: token })}\n`, {
+async function writeCredentialsFile(
+  path: string,
+  credentials: TokenCredentials,
+): Promise<void> {
+  await assertSafeCredentialsPath(path);
+  await writeFile(path, serializedCredentials(credentials), {
     encoding: "utf8",
     mode: 0o600,
   });
   await chmod(path, 0o600);
+}
+
+export async function saveCredentials(
+  credentials: TokenCredentials,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const directory = configDirectory(environment);
+  const path = credentialsPath(environment);
+
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  await writeCredentialsFile(path, credentials);
 
   return path;
+}
+
+export async function saveBearerToken(
+  value: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  return saveCredentials({ accessToken: value }, environment);
+}
+
+export async function saveLocalCredentials(
+  credentials: TokenCredentials,
+  cwd: string = process.cwd(),
+): Promise<string> {
+  const path = localCredentialsPath(cwd);
+  await writeCredentialsFile(path, credentials);
+
+  return path;
+}
+
+export async function saveLocalBearerToken(
+  value: string,
+  cwd: string = process.cwd(),
+): Promise<string> {
+  return saveLocalCredentials({ accessToken: value }, cwd);
+}
+
+export async function persistRefreshedCredentials(
+  resolved: ResolvedCredentials,
+  credentials: TokenCredentials,
+): Promise<void> {
+  if (!resolved.credentialsPath) {
+    throw new CliError(
+      "REFRESH_NOT_PERSISTABLE",
+      "Refreshed credentials cannot be persisted for command-line or environment authentication.",
+      3,
+    );
+  }
+  if (resolved.source === "credentials-file") {
+    const directory = dirname(resolved.credentialsPath);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+  }
+  await writeCredentialsFile(resolved.credentialsPath, credentials);
 }
 
 export async function clearStoredBearerToken(
@@ -320,16 +475,32 @@ export async function getTokenStatus(
   options: ResolveTokenOptions = {},
 ): Promise<TokenStatus> {
   try {
-    const resolved = await resolveBearerToken(options);
-    const expiration = tokenExpiration(resolved.token);
+    const resolved = await resolveCredentials(options);
+    const expiration = tokenExpiration(resolved.accessToken);
+    const accessExpiresAt =
+      expiration !== undefined
+        ? new Date(expiration * 1000).toISOString()
+        : resolved.accessExpiresAt;
+    const refreshExpiration = resolved.refreshToken
+      ? tokenExpiration(resolved.refreshToken)
+      : undefined;
+    const refreshExpiresAt =
+      refreshExpiration !== undefined
+        ? new Date(refreshExpiration * 1000).toISOString()
+        : resolved.refreshExpiresAt;
     const status: TokenStatus = {
       configured: true,
       source: resolved.source,
+      refreshConfigured: Boolean(resolved.refreshToken),
     };
 
-    if (expiration !== undefined) {
-      status.expiresAt = new Date(expiration * 1000).toISOString();
-      status.expired = expiration * 1000 <= Date.now();
+    if (accessExpiresAt) {
+      status.expiresAt = accessExpiresAt;
+      status.expired = Date.parse(accessExpiresAt) <= Date.now();
+    }
+    if (refreshExpiresAt) {
+      status.refreshExpiresAt = refreshExpiresAt;
+      status.refreshExpired = Date.parse(refreshExpiresAt) <= Date.now();
     }
 
     return status;

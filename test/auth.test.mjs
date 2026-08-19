@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,12 +9,15 @@ import {
   credentialsPath,
   localCredentialsPath,
   parseCredentialStorage,
+  persistRefreshedCredentials,
   resolveBearerToken,
+  resolveCredentials,
   saveBearerToken,
+  saveCredentials,
   saveLocalBearerToken,
 } from "../dist/auth.js";
 
-test("parses an encoded credentialStorage value and returns only access metadata", () => {
+test("parses access and refresh credentials without retaining user data", () => {
   const storage = {
     state: {
       access: {
@@ -38,11 +41,13 @@ test("parses an encoded credentialStorage value and returns only access metadata
     .replaceAll(",", "%2C");
 
   assert.deepEqual(result, {
-    token: "synthetic-access-token",
-    expiresAt: "2030-01-02T03:04:05.000Z",
+    accessToken: "synthetic-access-token",
+    accessExpiresAt: "2030-01-02T03:04:05.000Z",
+    refreshToken: "synthetic-refresh-token",
+    refreshExpiresAt: "2030-01-09T03:04:05.000Z",
   });
   assert.deepEqual(parseCredentialStorage(partiallyEncoded), result);
-  assert.doesNotMatch(JSON.stringify(result), /refresh|example-user/);
+  assert.doesNotMatch(JSON.stringify(result), /example-user/);
 });
 
 test("rejects credentialStorage without an access token", () => {
@@ -90,9 +95,58 @@ test("command-line bearer takes precedence over environment and stored credentia
     });
 
     const saved = JSON.parse(await readFile(credentialsPath(environment), "utf8"));
-    assert.deepEqual(saved, { bearerToken: "stored-token" });
+    assert.deepEqual(saved, { schemaVersion: 1, accessToken: "stored-token" });
     await assert.rejects(readFile(localCredentialsPath(directory), "utf8"), {
       code: "ENOENT",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("reads legacy bearerToken files and persists rotated refresh credentials", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stockbit-cli-refresh-"));
+  const environment = {
+    ...process.env,
+    STOCKBIT_CONFIG_DIR: directory,
+  };
+
+  try {
+    await writeFile(
+      credentialsPath(environment),
+      `${JSON.stringify({ bearerToken: "legacy-access-token" })}\n`,
+      { mode: 0o600 },
+    );
+    assert.deepEqual(await resolveCredentials({ environment, cwd: directory }), {
+      accessToken: "legacy-access-token",
+      source: "credentials-file",
+      credentialsPath: credentialsPath(environment),
+    });
+
+    await saveCredentials(
+      {
+        accessToken: "old-access-token",
+        refreshToken: "old-refresh-token",
+        accessExpiresAt: "2030-01-02T03:04:05Z",
+        refreshExpiresAt: "2030-01-09T03:04:05Z",
+      },
+      environment,
+    );
+    const resolved = await resolveCredentials({ environment, cwd: directory });
+    await persistRefreshedCredentials(resolved, {
+      accessToken: "new-access-token",
+      refreshToken: "new-refresh-token",
+      accessExpiresAt: "2030-02-02T03:04:05Z",
+      refreshExpiresAt: "2030-02-09T03:04:05Z",
+    });
+
+    const saved = JSON.parse(await readFile(credentialsPath(environment), "utf8"));
+    assert.deepEqual(saved, {
+      schemaVersion: 1,
+      accessToken: "new-access-token",
+      refreshToken: "new-refresh-token",
+      accessExpiresAt: "2030-02-02T03:04:05.000Z",
+      refreshExpiresAt: "2030-02-09T03:04:05.000Z",
     });
   } finally {
     await rm(directory, { recursive: true, force: true });

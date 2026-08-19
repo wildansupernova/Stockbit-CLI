@@ -10,14 +10,19 @@ import {
   localCredentialsPath,
   readBearerToken,
   readCredentialStorage,
-  resolveBearerToken,
-  saveBearerToken,
-  saveLocalBearerToken,
+  resolveCredentials,
+  persistRefreshedCredentials,
+  saveCredentials,
+  saveLocalCredentials,
   parseCredentialStorage,
+  type TokenCredentials,
 } from "./auth.js";
 import { CliError } from "./errors.js";
+import { serializeFundamentalCsv } from "./financial-csv.js";
+import { getAgentHelp, parseHelpTopic, renderAgentHelp } from "./help.js";
 import {
   parseDataType,
+  parseFundamentalView,
   parseReportType,
   parseStatementType,
   StockbitClient,
@@ -26,6 +31,7 @@ import {
 const program = new Command();
 
 program.configureHelp({ showGlobalOptions: true });
+program.addHelpCommand(false);
 
 program
   .name("stockbit")
@@ -37,12 +43,15 @@ program
   )
   .showHelpAfterError();
 
-const auth = program.command("auth").description("Manage the Stockbit bearer token.");
+const auth = program.command("auth").description("Manage Stockbit authentication credentials.");
 
-async function saveToken(token: string, local: boolean | undefined): Promise<string> {
+async function saveToken(
+  credentials: TokenCredentials,
+  local: boolean | undefined,
+): Promise<string> {
   const path = local
-    ? await saveLocalBearerToken(token)
-    : await saveBearerToken(token);
+    ? await saveLocalCredentials(credentials)
+    : await saveCredentials(credentials);
   if (local) {
     process.stdout.write(
       "Warning: add credentials-stockbit.json to this project's .gitignore.\n",
@@ -51,9 +60,26 @@ async function saveToken(token: string, local: boolean | undefined): Promise<str
   return path;
 }
 
+async function authenticatedClient(bearer: string | undefined): Promise<StockbitClient> {
+  const credentials = await resolveCredentials({ bearer });
+  return new StockbitClient({
+    token: credentials.accessToken,
+    ...(credentials.refreshToken ? { refreshToken: credentials.refreshToken } : {}),
+    ...(credentials.accessExpiresAt
+      ? { accessExpiresAt: credentials.accessExpiresAt }
+      : {}),
+    ...(credentials.credentialsPath
+      ? {
+          onCredentialsRefreshed: async (refreshed) =>
+            persistRefreshedCredentials(credentials, refreshed),
+        }
+      : {}),
+  });
+}
+
 auth
   .command("login")
-  .description("Import the access token from Stockbit credentialStorage.")
+  .description("Import access and refresh tokens from Stockbit credentialStorage.")
   .option("--local", "Save credentials-stockbit.json in the current directory.")
   .action(async (options: { local?: boolean }) => {
     process.stdout.write(
@@ -61,32 +87,42 @@ auth
         "1. Log in at https://stockbit.com in your browser.",
         "2. Open Developer Tools → Application → Local Storage → https://stockbit.com.",
         "3. Copy the value for credentialStorage, then paste it below.",
-        "The value is read locally, is not echoed, and the refresh token is not stored.",
+        "The value is read locally, is not echoed, and only its access/refresh tokens are stored.",
         "",
       ].join("\n"),
     );
     const value = await readCredentialStorage();
     const parsed = parseCredentialStorage(value);
-    const path = await saveToken(parsed.token, options.local);
-    process.stdout.write(`Access token saved to ${path} with user-only permissions.\n`);
-    if (parsed.expiresAt) {
-      process.stdout.write(`Access token expires at: ${parsed.expiresAt}\n`);
+    const path = await saveToken(parsed, options.local);
+    process.stdout.write(`Credentials saved to ${path} with user-only permissions.\n`);
+    if (parsed.accessExpiresAt) {
+      process.stdout.write(`Access token expires at: ${parsed.accessExpiresAt}\n`);
+    }
+    if (parsed.refreshToken) {
+      process.stdout.write("Automatic access-token refresh is enabled.\n");
+    } else {
+      process.stdout.write(
+        "No refresh token was found; run auth login again when the access token expires.\n",
+      );
+    }
+    if (parsed.refreshExpiresAt) {
+      process.stdout.write(`Refresh token expires at: ${parsed.refreshExpiresAt}\n`);
     }
   });
 
 auth
   .command("set-token")
-  .description("Read a bearer token without echoing it and store it for later use.")
+  .description("Store an access token without automatic refresh.")
   .option("--local", "Save credentials-stockbit.json in the current directory.")
   .action(async (options: { local?: boolean }) => {
     const token = await readBearerToken();
-    const path = await saveToken(token, options.local);
+    const path = await saveToken({ accessToken: token }, options.local);
     process.stdout.write(`Bearer token saved to ${path} with user-only permissions.\n`);
   });
 
 auth
   .command("status")
-  .description("Validate the configured token and return the current Stockbit profile.")
+  .description("Validate authentication, refreshing if needed, and return the profile.")
   .option("--json", "Print machine-readable JSON.")
   .action(async (options: { json?: boolean }, command: Command) => {
     const bearer = command.optsWithGlobals<{ bearer?: string }>().bearer;
@@ -103,33 +139,43 @@ auth
       return;
     }
 
-    const resolved = await resolveBearerToken({ bearer });
-    const profile = await new StockbitClient({ token: resolved.token }).userProfile();
+    const profile = await (await authenticatedClient(bearer)).userProfile();
+    const currentStatus = await getTokenStatus({ bearer });
     const result = {
       schema_version: "1",
       configured: true,
       authenticated: true,
-      source: status.source,
-      ...(status.expiresAt ? { expires_at: status.expiresAt } : {}),
-      ...(status.expired !== undefined ? { expired: status.expired } : {}),
+      source: currentStatus.source,
+      ...(currentStatus.expiresAt ? { expires_at: currentStatus.expiresAt } : {}),
+      ...(currentStatus.expired !== undefined ? { expired: currentStatus.expired } : {}),
+      refresh_configured: currentStatus.refreshConfigured ?? false,
+      ...(currentStatus.refreshExpiresAt
+        ? { refresh_expires_at: currentStatus.refreshExpiresAt }
+        : {}),
+      ...(currentStatus.refreshExpired !== undefined
+        ? { refresh_expired: currentStatus.refreshExpired }
+        : {}),
       profile: profile.data,
       meta: profile.meta,
     };
 
     if (!options.json) {
-      process.stdout.write(`Authenticated via ${status.source}.\n`);
-      if (status.expiresAt) {
+      process.stdout.write(`Authenticated via ${currentStatus.source}.\n`);
+      if (currentStatus.expiresAt) {
         process.stdout.write(
-          `Token expires at: ${status.expiresAt}${status.expired ? " (expired)" : ""}\n`,
+          `Access token expires at: ${currentStatus.expiresAt}${currentStatus.expired ? " (expired)" : ""}\n`,
         );
       }
+      process.stdout.write(
+        `Automatic refresh: ${currentStatus.refreshConfigured ? "configured" : "not configured"}.\n`,
+      );
     }
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   });
 
 auth
   .command("clear")
-  .description("Remove a stored bearer token.")
+  .description("Remove stored access and refresh credentials.")
   .option("--local", "Remove credentials-stockbit.json from the current directory.")
   .action(async (options: { local?: boolean }) => {
     const removed = options.local
@@ -138,8 +184,8 @@ auth
     const path = options.local ? localCredentialsPath() : credentialsPath();
     process.stdout.write(
       removed
-        ? `Removed the stored token from ${path}.\n`
-        : `No stored bearer token was found at ${path}.\n`,
+        ? `Removed the stored credentials from ${path}.\n`
+        : `No stored credentials were found at ${path}.\n`,
     );
     if (process.env.STOCKBIT_BEARER_TOKEN) {
       process.stdout.write("STOCKBIT_BEARER_TOKEN is still set in the environment.\n");
@@ -162,7 +208,8 @@ program
     "quarterly",
   )
   .option("--data-type <number>", "Stockbit data type", "1")
-  .option("--compact", "Print compact JSON instead of pretty JSON.")
+  .option("--view <format>", "Response format: json|raw|csv", "raw")
+  .option("--compact", "Print compact JSON for json/raw views.")
   .action(
     async (
       symbol: string,
@@ -170,24 +217,45 @@ program
         report: string;
         statement: string;
         dataType: string;
+        view: string;
         compact?: boolean;
       },
     ) => {
       const bearer = program.opts<{ bearer?: string }>().bearer;
-      const { token } = await resolveBearerToken({ bearer });
-      const client = new StockbitClient({ token });
+      const client = await authenticatedClient(bearer);
+      const view = parseFundamentalView(options.view);
       const result = await client.fundamental({
         symbol,
         dataType: parseDataType(options.dataType),
         reportType: parseReportType(options.report),
         statementType: parseStatementType(options.statement),
+        view,
       });
+
+      if (result.view === "csv") {
+        process.stdout.write(`${serializeFundamentalCsv(result)}\n`);
+        return;
+      }
 
       process.stdout.write(
         `${JSON.stringify(result, null, options.compact ? undefined : 2)}\n`,
       );
     },
   );
+
+program
+  .command("help")
+  .description("Show the command reference for humans or AI agents.")
+  .argument("[topic]", "Topic: all|commands|auth|fundamental|formats", "all")
+  .option("--json", "Print a structured, machine-readable help document.")
+  .action((topic: string, options: { json?: boolean }) => {
+    const document = getAgentHelp(parseHelpTopic(topic));
+    process.stdout.write(
+      options.json
+        ? `${JSON.stringify(document, null, 2)}\n`
+        : renderAgentHelp(document),
+    );
+  });
 
 program.parseAsync().catch((error: unknown) => {
   if (error instanceof CliError) {
