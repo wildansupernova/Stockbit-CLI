@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+credentials-stockbit.json
+*.log
+.DS_Store

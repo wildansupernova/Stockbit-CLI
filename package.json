@@ -1,0 +1,32 @@
+{
+  "name": "stockbit-cli",
+  "version": "0.1.0",
+  "description": "A command-line client for authorized Stockbit financial data access.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "stockbit": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}
