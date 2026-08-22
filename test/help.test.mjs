@@ -33,11 +33,15 @@ test("builds a complete machine-readable agent reference", () => {
     document.fundamentals.statement_types.find(({ name }) => name === "q2").value,
     6,
   );
+  assert.equal(document.broker_summary.transaction_types.length, 2);
+  assert.equal(document.broker_summary.investor_types.length, 3);
+  assert.equal(document.broker_summary.market_boards.length, 4);
 });
 
 test("supports focused topics and readable rendering", () => {
   assert.equal(parseHelpTopic("authentication"), "auth");
   assert.equal(parseHelpTopic("views"), "formats");
+  assert.equal(parseHelpTopic("brokers"), "broker-summary");
   assert.throws(() => parseHelpTopic("prices"), /unknown help topic/i);
 
   const document = getAgentHelp("formats");
@@ -50,6 +54,22 @@ test("supports focused topics and readable rendering", () => {
   assert.match(rendered, /Machine-readable reference: stockbit help --json/u);
   assert.match(rendered, /json \(application\/json\)/u);
   assert.match(rendered, /csv \(text\/csv\)/u);
+});
+
+test("stockbit help broker-summary --json documents broker semantics", async () => {
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    cliPath,
+    "help",
+    "broker-summary",
+    "--json",
+  ]);
+  const document = JSON.parse(stdout);
+
+  assert.equal(stderr, "");
+  assert.equal(document.topic, "broker-summary");
+  assert.match(document.broker_summary.transaction_types[0].semantics, /both sides/iu);
+  assert.match(document.broker_summary.transaction_types[1].semantics, /difference/iu);
+  assert.equal(document.broker_summary.market_boards[1].value, "MARKET_BOARD_REGULER");
 });
 
 test("stockbit help formats --json runs without authentication", async () => {

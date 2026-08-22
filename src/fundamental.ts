@@ -1,5 +1,17 @@
 import { CliError } from "./errors.js";
 import {
+  brokerBoardName,
+  brokerInvestorName,
+  brokerTransactionName,
+  parseBrokerDate,
+  parseBrokerLimit,
+  parseBrokerSummaryResponse,
+  validateBrokerDateRange,
+  type BrokerSummaryMeta,
+  type BrokerSummaryRequest,
+  type BrokerSummaryResponse,
+} from "./broker-summary.js";
+import {
   parseFinancialHtmlResponse,
   type ParsedFinancialData,
 } from "./financial-parser.js";
@@ -585,6 +597,72 @@ export class StockbitClient {
         ...meta,
         parser: {
           name: "stockbit-financial-html",
+          version: "1",
+          warnings: parsed.warnings,
+        },
+      },
+    };
+  }
+
+  async brokerSummary(request: BrokerSummaryRequest): Promise<BrokerSummaryResponse> {
+    const symbol = normalizeSymbol(request.symbol);
+    const from = parseBrokerDate(request.from, "from");
+    const to = parseBrokerDate(request.to, "to");
+    validateBrokerDateRange(from, to);
+    const limit = parseBrokerLimit(String(request.limit));
+    const transaction = brokerTransactionName(request.transactionType);
+    const investor = brokerInvestorName(request.investorType);
+    const board = brokerBoardName(request.marketBoard);
+    const normalizedRequest: BrokerSummaryRequest = {
+      ...request,
+      symbol,
+      from,
+      to,
+      limit,
+    };
+    const rawData = await this.getJson(`marketdetectors/${symbol}`, {
+      from,
+      to,
+      transaction_type: request.transactionType,
+      market_board: request.marketBoard,
+      investor_type: request.investorType,
+      limit: String(limit),
+    });
+    const view = request.view ?? "raw";
+    const meta: BrokerSummaryMeta = {
+      source: "stockbit",
+      endpoint: "marketdetectors/:symbol",
+      symbol,
+      from,
+      to,
+      transaction_type: request.transactionType,
+      transaction,
+      investor_type: request.investorType,
+      investor,
+      market_board: request.marketBoard,
+      board,
+      limit,
+      fetched_at: new Date().toISOString(),
+    };
+
+    if (view === "raw") {
+      return {
+        schema_version: "1",
+        view,
+        data: rawData,
+        meta,
+      };
+    }
+
+    const parsed = parseBrokerSummaryResponse(rawData, normalizedRequest);
+    return {
+      schema_version: "1",
+      view,
+      data: parsed.data,
+      meta: {
+        ...meta,
+        parser: {
+          name: "stockbit-broker-summary",
           version: "1",
           warnings: parsed.warnings,
         },

@@ -1,0 +1,107 @@
+{
+  "message": "Successfully retrieved market detector data",
+  "data": {
+    "bandar_detector": {
+      "average": 6344.1304,
+      "avg": {
+        "accdist": "Big Acc",
+        "amount": 481203400000,
+        "percent": 111.3724,
+        "vol": 758501.75
+      },
+      "avg5": {
+        "accdist": "Big Acc",
+        "amount": 425088580000,
+        "percent": 98.38488,
+        "vol": 670050.2
+      },
+      "broker_accdist": "Dist",
+      "number_broker_buysell": 6,
+      "top1": {
+        "accdist": "Big Acc",
+        "amount": 240489480000,
+        "percent": 55.66023,
+        "vol": 379074
+      },
+      "top3": {
+        "accdist": "Big Acc",
+        "amount": 436243960000,
+        "percent": 100.96674,
+        "vol": 687634
+      },
+      "top5": {
+        "accdist": "Big Acc",
+        "amount": 582277600000,
+        "percent": 134.76558,
+        "vol": 917821
+      },
+      "top10": {
+        "accdist": "Big Acc",
+        "amount": 726332500000,
+        "percent": 168.10646,
+        "vol": 1144889
+      },
+      "total_buyer": 54,
+      "total_seller": 48,
+      "value": 432067000000,
+      "volume": 681050
+    },
+    "broker_summary": {
+      "brokers_buy": [
+        {
+          "blot": "246537",
+          "blotv": "2.46537e+07",
+          "bval": "1.56430395e+11",
+          "bvalv": "1.56430395e+11",
+          "netbs_broker_code": "AA",
+          "netbs_buy_avg_price": "6345.108239331216",
+          "netbs_date": "20260819",
+          "netbs_stock_code": "BBCA",
+          "type": "Asing",
+          "freq": "2451"
+        },
+        {
+          "blot": "81355",
+          "blotv": "8.1355e+06",
+          "bval": "5.18291e+10",
+          "bvalv": "5.18291e+10",
+          "netbs_broker_code": "BB",
+          "netbs_buy_avg_price": "6370.733206317989",
+          "netbs_date": "20260819",
+          "netbs_stock_code": "BBCA",
+          "type": "Lokal",
+          "freq": "1155"
+        }
+      ],
+      "brokers_sell": [
+        {
+          "netbs_broker_code": "AA",
+          "netbs_date": "20260819",
+          "netbs_sell_avg_price": "6339.626293035152",
+          "netbs_stock_code": "BBCA",
+          "slot": "132537",
+          "slotv": "1.32537e+07",
+          "sval": "8.4023505e+10",
+          "svalv": "8.4023505e+10",
+          "type": "Asing",
+          "freq": "1284"
+        },
+        {
+          "netbs_broker_code": "CC",
+          "netbs_date": "20260819",
+          "netbs_sell_avg_price": "6319.586408697339",
+          "netbs_stock_code": "BBCA",
+          "slot": "87659",
+          "slotv": "8.7659e+06",
+          "sval": "5.53968625e+10",
+          "svalv": "5.53968625e+10",
+          "type": "Lokal",
+          "freq": "664"
+        }
+      ],
+      "symbol": "BBCA"
+    },
+    "from": "2026-08-19",
+    "to": "2026-08-19"
+  }
+}

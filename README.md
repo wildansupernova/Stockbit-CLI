@@ -1,6 +1,6 @@
 # Stockbit CLI
 
-A TypeScript command-line client for retrieving authorized Stockbit financial data.
+A TypeScript command-line client for retrieving authorized Stockbit fundamentals and broker-summary data.
 
 > [!IMPORTANT]
 > Use this client only with an account and data access you are authorized to automate. Never commit or share bearer tokens. This project is unofficial and is not affiliated with Stockbit.
@@ -53,16 +53,18 @@ AI agents and scripts should request the versioned JSON document:
 stockbit help --json
 stockbit help auth --json
 stockbit help fundamental --json
+stockbit help broker-summary --json
 stockbit help formats --json
 ```
 
-Available topics are `all`, `commands`, `auth`, `fundamental`, and `formats`. The structured reference includes authentication precedence and safety, every fundamental report and statement value, output contracts, examples, exit-code meanings, and guidance for choosing `json`, `raw`, or `csv`. The help command is local-only and does not read credentials or access the network.
+Available topics are `all`, `commands`, `auth`, `fundamental`, `broker-summary`, and `formats`. The structured reference includes authentication precedence and safety, every fundamental and broker-summary enum, output contracts, examples, exit-code meanings, and guidance for choosing `json`, `raw`, or `csv`. The help command is local-only and does not read credentials or access the network.
 
 Standard command-specific help remains available:
 
 ```bash
 stockbit auth --help
 stockbit fundamental --help
+stockbit broker-summary --help
 ```
 
 ## Authentication
@@ -297,6 +299,87 @@ The `json` and `raw` views print a versioned JSON envelope. Use `--compact` for 
 
 ```bash
 stockbit fundamental JTPE --view json --compact
+```
+
+## Fetch broker summaries
+
+Fetch BBCA's gross regular-market broker summary for one trading date:
+
+```bash
+stockbit broker-summary BBCA \
+  --from 2026-08-19 \
+  --transaction gross \
+  --investor all \
+  --board regular \
+  --view json
+```
+
+`--to` defaults to the `--from` date. For a range:
+
+```bash
+stockbit broker-summary BBCA --from 2026-08-19 --to 2026-08-20 --view json
+```
+
+Fetch net foreign activity across all market boards:
+
+```bash
+stockbit broker-summary BBCA \
+  --from 2026-08-19 \
+  --transaction net \
+  --investor foreign \
+  --board all \
+  --view json
+```
+
+Export one row per broker side to CSV:
+
+```bash
+stockbit broker-summary BBCA --from 2026-08-19 --view csv > bbca-brokers.csv
+```
+
+Supported transaction types:
+
+| CLI value | Stockbit value | Meaning |
+| --- | --- | --- |
+| `gross` | `TRANSACTION_TYPE_GROSS` | Buy and sell activity is ranked independently; a broker may appear on both sides. |
+| `net` | `TRANSACTION_TYPE_NET` | Each entry is the broker's buy-minus-sell difference; sell lots and values may be negative. |
+
+Supported investor types:
+
+| CLI value | Stockbit value |
+| --- | --- |
+| `all` | `INVESTOR_TYPE_ALL` |
+| `domestic` | `INVESTOR_TYPE_DOMESTIC` |
+| `foreign` | `INVESTOR_TYPE_FOREIGN` |
+
+Supported market boards:
+
+| CLI value | Stockbit value |
+| --- | --- |
+| `all` | `MARKET_BOARD_ALL` |
+| `regular` | `MARKET_BOARD_REGULER` |
+| `cash` | `MARKET_BOARD_TUNAI` |
+| `negotiated` | `MARKET_BOARD_NEGO` |
+
+The normalized `json` response includes:
+
+- buy/sell broker counts and overlap count;
+- a transaction-semantics explanation;
+- normalized broker codes, side, rank, date, average price, lots, volume, value, frequency, and investor origin;
+- `appears_on_both_sides` for gross analysis;
+- market-detector accumulation/distribution analytics and top-broker tiers;
+- exact broker numeric strings, including scientific notation and signed net sells.
+
+For each broker, `lots` and `value` represent the requested gross or net measure. `side_volume` and `side_value` preserve Stockbit's side reference fields (`blotv`/`slotv` and `bvalv`/`svalv`).
+
+Broker counts and overlap counts describe the rows returned under `--limit`, not every broker outside that response window.
+
+Valid success responses may contain both sides, only one side, or two empty arrays. Empty data—observed for BBCA on `cash`/`TUNAI` for 2026-08-19—is returned with `summary.empty: true`, not treated as an error. In CSV mode, an empty response still emits one metadata row. HTTP `429` is reported as `RATE_LIMITED` with exit code `4`.
+
+Use `--view raw` to preserve Stockbit's original response:
+
+```bash
+stockbit broker-summary BBCA --from 2026-08-19 --view raw --compact
 ```
 
 ## Checks

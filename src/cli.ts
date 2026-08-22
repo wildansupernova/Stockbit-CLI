@@ -3,6 +3,15 @@
 import { Command } from "commander";
 
 import {
+  parseBrokerDate,
+  parseBrokerInvestorType,
+  parseBrokerLimit,
+  parseBrokerMarketBoard,
+  parseBrokerTransactionType,
+  serializeBrokerSummaryCsv,
+  validateBrokerDateRange,
+} from "./broker-summary.js";
+import {
   clearLocalStoredBearerToken,
   clearStoredBearerToken,
   credentialsPath,
@@ -244,9 +253,66 @@ program
   );
 
 program
+  .command("broker-summary")
+  .alias("brokers")
+  .description("Fetch broker buy/sell rankings and market-detector analytics.")
+  .argument("<symbol>", "Ticker symbol, for example BBCA")
+  .requiredOption("--from <date>", "Start date in YYYY-MM-DD format.")
+  .option("--to <date>", "End date in YYYY-MM-DD format; defaults to --from.")
+  .option("-t, --transaction <type>", "Transaction: gross|net", "gross")
+  .option("-i, --investor <type>", "Investor: all|domestic|foreign", "all")
+  .option("-b, --board <type>", "Market board: all|regular|cash|negotiated", "regular")
+  .option("-l, --limit <number>", "Maximum brokers returned per side.", "25")
+  .option("--view <format>", "Response format: json|raw|csv", "raw")
+  .option("--compact", "Print compact JSON for json/raw views.")
+  .action(
+    async (
+      symbol: string,
+      options: {
+        from: string;
+        to?: string;
+        transaction: string;
+        investor: string;
+        board: string;
+        limit: string;
+        view: string;
+        compact?: boolean;
+      },
+    ) => {
+      const from = parseBrokerDate(options.from, "from");
+      const to = parseBrokerDate(options.to ?? options.from, "to");
+      validateBrokerDateRange(from, to);
+      const bearer = program.opts<{ bearer?: string }>().bearer;
+      const client = await authenticatedClient(bearer);
+      const result = await client.brokerSummary({
+        symbol,
+        from,
+        to,
+        transactionType: parseBrokerTransactionType(options.transaction),
+        investorType: parseBrokerInvestorType(options.investor),
+        marketBoard: parseBrokerMarketBoard(options.board),
+        limit: parseBrokerLimit(options.limit),
+        view: parseFundamentalView(options.view),
+      });
+
+      if (result.view === "csv") {
+        process.stdout.write(`${serializeBrokerSummaryCsv(result)}\n`);
+        return;
+      }
+      process.stdout.write(
+        `${JSON.stringify(result, null, options.compact ? undefined : 2)}\n`,
+      );
+    },
+  );
+
+program
   .command("help")
   .description("Show the command reference for humans or AI agents.")
-  .argument("[topic]", "Topic: all|commands|auth|fundamental|formats", "all")
+  .argument(
+    "[topic]",
+    "Topic: all|commands|auth|fundamental|broker-summary|formats",
+    "all",
+  )
   .option("--json", "Print a structured, machine-readable help document.")
   .action((topic: string, options: { json?: boolean }) => {
     const document = getAgentHelp(parseHelpTopic(topic));
