@@ -36,6 +36,12 @@ import {
   parseStatementType,
   StockbitClient,
 } from "./fundamental.js";
+import {
+  parsePriceDate,
+  parsePriceLimit,
+  serializePriceCsv,
+  validatePriceDateRange,
+} from "./price.js";
 
 const program = new Command();
 
@@ -44,7 +50,7 @@ program.addHelpCommand(false);
 
 program
   .name("stockbit")
-  .description("Retrieve authorized Stockbit financial data from the command line.")
+  .description("Retrieve authorized Stockbit financial and market data from the command line.")
   .version("0.1.0")
   .option(
     "--bearer <token>",
@@ -306,11 +312,55 @@ program
   );
 
 program
+  .command("price")
+  .alias("prices")
+  .description("Fetch daily OHLCV price history.")
+  .argument("<symbol>", "Ticker symbol, for example ERAA")
+  .requiredOption("--from <date>", "Oldest date in YYYY-MM-DD format.")
+  .requiredOption("--to <date>", "Newest date in YYYY-MM-DD format.")
+  .option("-l, --limit <number>", "Maximum rows; 0 requests all rows.", "0")
+  .option("--view <format>", "Response format: json|raw|csv", "raw")
+  .option("--compact", "Print compact JSON for json/raw views.")
+  .action(
+    async (
+      symbol: string,
+      options: {
+        from: string;
+        to: string;
+        limit: string;
+        view: string;
+        compact?: boolean;
+      },
+    ) => {
+      const from = parsePriceDate(options.from, "from");
+      const to = parsePriceDate(options.to, "to");
+      validatePriceDateRange(from, to);
+      const bearer = program.opts<{ bearer?: string }>().bearer;
+      const client = await authenticatedClient(bearer);
+      const result = await client.price({
+        symbol,
+        from,
+        to,
+        limit: parsePriceLimit(options.limit),
+        view: parseFundamentalView(options.view),
+      });
+
+      if (result.view === "csv") {
+        process.stdout.write(`${serializePriceCsv(result)}\n`);
+        return;
+      }
+      process.stdout.write(
+        `${JSON.stringify(result, null, options.compact ? undefined : 2)}\n`,
+      );
+    },
+  );
+
+program
   .command("help")
   .description("Show the command reference for humans or AI agents.")
   .argument(
     "[topic]",
-    "Topic: all|commands|auth|fundamental|broker-summary|formats",
+    "Topic: all|commands|auth|fundamental|broker-summary|price|formats",
     "all",
   )
   .option("--json", "Print a structured, machine-readable help document.")

@@ -15,6 +15,15 @@ import {
   parseFinancialHtmlResponse,
   type ParsedFinancialData,
 } from "./financial-parser.js";
+import {
+  parsePriceDate,
+  parsePriceLimit,
+  parsePriceResponse,
+  validatePriceDateRange,
+  type PriceMeta,
+  type PriceRequest,
+  type PriceResponse,
+} from "./price.js";
 
 export const REPORT_TYPES = {
   income: 1,
@@ -663,6 +672,65 @@ export class StockbitClient {
         ...meta,
         parser: {
           name: "stockbit-broker-summary",
+          version: "1",
+          warnings: parsed.warnings,
+        },
+      },
+    };
+  }
+
+  async price(request: PriceRequest): Promise<PriceResponse> {
+    const symbol = normalizeSymbol(request.symbol);
+    const from = parsePriceDate(request.from, "from");
+    const to = parsePriceDate(request.to, "to");
+    validatePriceDateRange(from, to);
+    const limit = parsePriceLimit(String(request.limit));
+    const normalizedRequest: PriceRequest = {
+      ...request,
+      symbol,
+      from,
+      to,
+      limit,
+    };
+
+    // Chartbit uses reversed names: `from` is the newer boundary and `to` is older.
+    const rawData = await this.getJson(`chartbit/${symbol}/price/daily`, {
+      from: to,
+      to: from,
+      limit: String(limit),
+    });
+    const view = request.view ?? "raw";
+    const meta: PriceMeta = {
+      source: "stockbit",
+      endpoint: "chartbit/:symbol/price/daily",
+      symbol,
+      interval: "daily",
+      from,
+      to,
+      upstream_from: to,
+      upstream_to: from,
+      limit,
+      fetched_at: new Date().toISOString(),
+    };
+
+    if (view === "raw") {
+      return {
+        schema_version: "1",
+        view,
+        data: rawData,
+        meta,
+      };
+    }
+
+    const parsed = parsePriceResponse(rawData, normalizedRequest);
+    return {
+      schema_version: "1",
+      view,
+      data: parsed.data,
+      meta: {
+        ...meta,
+        parser: {
+          name: "stockbit-daily-price",
           version: "1",
           warnings: parsed.warnings,
         },

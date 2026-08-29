@@ -1,6 +1,6 @@
 # Stockbit CLI
 
-A TypeScript command-line client for retrieving authorized Stockbit fundamentals and broker-summary data.
+A TypeScript command-line client for retrieving authorized Stockbit fundamentals, broker-summary data, and daily price history.
 
 > [!IMPORTANT]
 > Use this client only with an account and data access you are authorized to automate. Never commit or share bearer tokens. This project is unofficial and is not affiliated with Stockbit.
@@ -54,10 +54,11 @@ stockbit help --json
 stockbit help auth --json
 stockbit help fundamental --json
 stockbit help broker-summary --json
+stockbit help price --json
 stockbit help formats --json
 ```
 
-Available topics are `all`, `commands`, `auth`, `fundamental`, `broker-summary`, and `formats`. The structured reference includes authentication precedence and safety, every fundamental and broker-summary enum, output contracts, examples, exit-code meanings, and guidance for choosing `json`, `raw`, or `csv`. The help command is local-only and does not read credentials or access the network.
+Available topics are `all`, `commands`, `auth`, `fundamental`, `broker-summary`, `price`, and `formats`. The structured reference includes authentication precedence and safety, fundamental and broker-summary enums, price-range semantics, output contracts, examples, exit-code meanings, and guidance for choosing `json`, `raw`, or `csv`. The help command is local-only and does not read credentials or access the network.
 
 Standard command-specific help remains available:
 
@@ -65,6 +66,7 @@ Standard command-specific help remains available:
 stockbit auth --help
 stockbit fundamental --help
 stockbit broker-summary --help
+stockbit price --help
 ```
 
 ## Authentication
@@ -154,6 +156,7 @@ Or use the requested one-command override:
 ```bash
 stockbit --bearer "your-token" fundamental JTPE
 stockbit --bearer "your-token" auth status --json
+stockbit --bearer "your-token" price ERAA --from 2026-08-01 --to 2026-08-28
 ```
 
 Avoid `--bearer` when possible because command-line arguments may be retained in shell history or exposed in the process list. The environment variable or saved credentials file is safer.
@@ -380,6 +383,80 @@ Use `--view raw` to preserve Stockbit's original response:
 
 ```bash
 stockbit broker-summary BBCA --from 2026-08-19 --view raw --compact
+```
+
+## Fetch daily prices
+
+Fetch ERAA daily OHLCV history as normalized JSON:
+
+```bash
+stockbit price ERAA \
+  --from 2025-06-09 \
+  --to 2026-08-31 \
+  --view json
+```
+
+The CLI uses conventional range semantics: `--from` is the oldest requested date and `--to` is the newest. Stockbit's private Chartbit endpoint uses those query names in reverse, so the CLI automatically sends the newer boundary as upstream `from` and the older boundary as upstream `to`. Normalized bars are sorted oldest-first even though the raw endpoint returns newest-first.
+
+`--from` and `--to` are both required. `--limit` defaults to `0`, which asks Stockbit for all rows in the range:
+
+```bash
+stockbit price BBCA --from 2026-01-01 --to 2026-08-28 --limit 0 --view json
+```
+
+Normalized JSON uses this shape:
+
+```json
+{
+  "schema_version": "1",
+  "view": "json",
+  "data": {
+    "symbol": "ERAA",
+    "interval": "daily",
+    "requested_range": {
+      "from": "2025-06-09",
+      "to": "2026-08-31"
+    },
+    "returned_range": {
+      "from": "2025-06-09",
+      "to": "2026-08-28"
+    },
+    "count": 300,
+    "empty": false,
+    "bars": [
+      {
+        "date": "2025-06-09",
+        "unix_timestamp": 1749402000,
+        "open": "440",
+        "high": "450",
+        "low": "438",
+        "close": "446",
+        "volume": "1234567"
+      }
+    ]
+  },
+  "meta": {
+    "parser": {
+      "name": "stockbit-daily-price",
+      "version": "1",
+      "warnings": []
+    }
+  }
+}
+```
+
+OHLCV fields are decimal strings to avoid precision loss; `unix_timestamp` and `count` are numbers. A valid range with no sessions is returned as `count: 0`, `empty: true`, and `bars: []`.
+
+Export one row per daily bar to CSV:
+
+```bash
+stockbit price ERAA --from 2025-06-09 --to 2026-08-31 --view csv > eraa-prices.csv
+```
+
+Use `raw` to preserve Stockbit's original `data.chartbit` payload and newest-first order:
+
+```bash
+stockbit price ERAA --from 2025-06-09 --to 2026-08-31 --view raw --compact
 ```
 
 ## Checks

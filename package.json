@@ -1,7 +1,7 @@
 {
   "name": "stockbit-cli",
   "version": "0.1.0",
-  "description": "A command-line client for authorized Stockbit financial data access.",
+  "description": "A command-line client for authorized Stockbit financial and market data access.",
   "license": "MIT",
   "type": "module",
   "bin": {

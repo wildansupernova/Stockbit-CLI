@@ -1,0 +1,23 @@
+{
+  "message": "Retrieved Chartbit Price",
+  "data": {
+    "chartbit": [
+      {
+        "unixdate": 1787850000,
+        "open": 530,
+        "high": 545,
+        "low": 525,
+        "close": 540,
+        "volume": "1837200"
+      },
+      {
+        "unixdate": 1787763600,
+        "open": "520",
+        "high": "535",
+        "low": "515",
+        "close": "530",
+        "volume": 1546100
+      }
+    ]
+  }
+}

@@ -12,6 +12,7 @@ export type HelpTopic =
   | "auth"
   | "fundamental"
   | "broker-summary"
+  | "price"
   | "formats";
 
 interface HelpCommand {
@@ -62,6 +63,13 @@ export interface AgentHelpDocument {
     response_notes: string[];
     examples: string[];
   };
+  prices?: {
+    syntax: string;
+    defaults: Record<string, string>;
+    date_semantics: string[];
+    response_notes: string[];
+    examples: string[];
+  };
   formats?: HelpFormat[];
   output_contract: {
     stdout: string;
@@ -83,6 +91,10 @@ const TOPIC_ALIASES: Readonly<Record<string, HelpTopic>> = {
   brokers: "broker-summary",
   "broker-summary": "broker-summary",
   "broker-summaries": "broker-summary",
+  price: "price",
+  prices: "price",
+  ohlcv: "price",
+  "price-history": "price",
   format: "formats",
   formats: "formats",
   view: "formats",
@@ -134,7 +146,19 @@ const COMMANDS: HelpCommand[] = [
     ],
   },
   {
-    command: "stockbit help [all|commands|auth|fundamental|broker-summary|formats] [--json]",
+    command: "stockbit price <symbol> --from <date> --to <date> [options]",
+    purpose: "Fetch normalized or raw daily OHLCV price history.",
+    options: [
+      "--from <YYYY-MM-DD> (required; oldest date)",
+      "--to <YYYY-MM-DD> (required; newest date)",
+      "--limit <non-negative-integer> (0 requests all rows)",
+      "--view <json|raw|csv>",
+      "--compact",
+      "--bearer <token> (global option)",
+    ],
+  },
+  {
+    command: "stockbit help [all|commands|auth|fundamental|broker-summary|price|formats] [--json]",
     purpose: "Show this reference as readable text or structured JSON.",
   },
 ];
@@ -143,7 +167,7 @@ const FORMATS: HelpFormat[] = [
   {
     name: "json",
     media_type: "application/json",
-    purpose: "Normalized financial or broker data for agents, scripts, and metric lookup.",
+    purpose: "Normalized financial, broker, or price data for agents and scripts.",
     shape: "Versioned envelope containing normalized data and request/parser metadata.",
   },
   {
@@ -156,7 +180,7 @@ const FORMATS: HelpFormat[] = [
     name: "csv",
     media_type: "text/csv",
     purpose: "Spreadsheet export and tabular pipelines.",
-    shape: "Header plus one row per account-period or broker-side record, with request metadata repeated.",
+    shape: "Header plus one row per account-period, broker-side record, or daily price bar, with request metadata repeated.",
   },
 ];
 
@@ -174,7 +198,7 @@ export function parseHelpTopic(value: string | undefined): HelpTopic {
   }
   throw new CliError(
     "INVALID_HELP_TOPIC",
-    `Unknown help topic \`${value}\`. Expected \`all\`, \`commands\`, \`auth\`, \`fundamental\`, \`broker-summary\`, or \`formats\`.`,
+    `Unknown help topic \`${value}\`. Expected \`all\`, \`commands\`, \`auth\`, \`fundamental\`, \`broker-summary\`, \`price\`, or \`formats\`.`,
     2,
   );
 }
@@ -184,7 +208,7 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
     schema_version: "1",
     command: "stockbit",
     topic,
-    summary: "Retrieve authorized Stockbit fundamentals and broker summaries without exposing credentials.",
+    summary: "Retrieve authorized Stockbit fundamentals, broker summaries, and price history without exposing credentials.",
     usage: [
       "stockbit help --json",
       "stockbit help <topic> --json",
@@ -208,11 +232,13 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
     },
     agent_guidance: [
       "Run `stockbit auth status --json` before a protected request when authentication is uncertain.",
-      "Prefer `--view json` for financial reasoning and exact metric lookup.",
-      "Use `--view csv` for tabular export and `--view raw` only to inspect upstream HTML.",
+      "Prefer `--view json` for normalized data, financial reasoning, and exact metric lookup.",
+      "Use `--view csv` for tabular export and `--view raw` only to inspect an unchanged upstream payload.",
       "Treat raw, IDR, and USD numeric fields as decimal strings to avoid precision loss.",
       "Match both the requested statement type and the returned period key before reporting a value.",
       "For broker summaries, distinguish gross side activity from signed net differences and check appears_on_both_sides.",
+      "For prices, pass the oldest date to --from and newest date to --to; normalized bars are returned oldest-first.",
+      "Treat normalized OHLCV fields as decimal strings to avoid precision loss.",
       "Never print, log, persist in source control, or return a bearer token or credentialStorage value.",
     ],
   };
@@ -322,6 +348,33 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
       ],
     };
   }
+  if (topic === "all" || topic === "price") {
+    document.prices = {
+      syntax: "stockbit price <symbol> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--limit <n>] [--view <json|raw|csv>] [--compact]",
+      defaults: {
+        limit: "0 (all rows returned by Stockbit)",
+        view: "raw",
+        interval: "daily",
+      },
+      date_semantics: [
+        "CLI --from is the oldest requested date and --to is the newest requested date.",
+        "Stockbit's private Chartbit endpoint reverses those query names; the CLI translates them automatically.",
+        "Normalized json/csv bars are sorted oldest-first even though Stockbit returns newest-first.",
+      ],
+      response_notes: [
+        "json returns normalized date, unix_timestamp, open, high, low, close, and volume fields.",
+        "Normalized OHLCV values are decimal strings; unix_timestamp and count are numbers.",
+        "A valid empty range returns count=0, empty=true, bars=[], and is not treated as an error.",
+        "raw preserves Stockbit's data.chartbit response and its original newest-first ordering.",
+        "CSV emits one row per daily bar and one metadata row for an empty response.",
+      ],
+      examples: [
+        "stockbit price ERAA --from 2025-06-09 --to 2026-08-31 --view json",
+        "stockbit price BBCA --from 2026-01-01 --to 2026-08-28 --view csv > bbca-prices.csv",
+        "stockbit price ERAA --from 2026-08-01 --to 2026-08-28 --view raw --compact",
+      ],
+    };
+  }
   if (topic === "all" || topic === "formats") {
     document.formats = FORMATS;
   }
@@ -399,6 +452,19 @@ export function renderAgentHelp(document: AgentHelpDocument): string {
         .join(", ")}`,
       ...renderList("Response notes", document.broker_summary.response_notes),
       ...renderList("Examples", document.broker_summary.examples),
+    );
+  }
+
+  if (document.prices) {
+    lines.push(
+      "Daily prices",
+      `  Syntax: ${document.prices.syntax}`,
+      `  Defaults: ${Object.entries(document.prices.defaults)
+        .map(([name, value]) => `${name}=${value}`)
+        .join(", ")}`,
+      ...renderList("Date semantics", document.prices.date_semantics),
+      ...renderList("Response notes", document.prices.response_notes),
+      ...renderList("Examples", document.prices.examples),
     );
   }
 

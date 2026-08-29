@@ -36,17 +36,22 @@ test("builds a complete machine-readable agent reference", () => {
   assert.equal(document.broker_summary.transaction_types.length, 2);
   assert.equal(document.broker_summary.investor_types.length, 3);
   assert.equal(document.broker_summary.market_boards.length, 4);
+  assert.equal(document.prices.defaults.interval, "daily");
+  assert.match(document.prices.date_semantics[1], /reverses/iu);
 });
 
 test("supports focused topics and readable rendering", () => {
   assert.equal(parseHelpTopic("authentication"), "auth");
   assert.equal(parseHelpTopic("views"), "formats");
   assert.equal(parseHelpTopic("brokers"), "broker-summary");
-  assert.throws(() => parseHelpTopic("prices"), /unknown help topic/i);
+  assert.equal(parseHelpTopic("prices"), "price");
+  assert.equal(parseHelpTopic("OHLCV"), "price");
+  assert.throws(() => parseHelpTopic("dividends"), /unknown help topic/i);
 
   const document = getAgentHelp("formats");
   assert.equal(document.authentication, undefined);
   assert.equal(document.fundamentals, undefined);
+  assert.equal(document.prices, undefined);
   assert.equal(document.commands, undefined);
   assert.equal(document.formats.length, 3);
 
@@ -54,6 +59,23 @@ test("supports focused topics and readable rendering", () => {
   assert.match(rendered, /Machine-readable reference: stockbit help --json/u);
   assert.match(rendered, /json \(application\/json\)/u);
   assert.match(rendered, /csv \(text\/csv\)/u);
+});
+
+test("stockbit help price --json documents range translation and formats", async () => {
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    cliPath,
+    "help",
+    "price",
+    "--json",
+  ]);
+  const document = JSON.parse(stdout);
+
+  assert.equal(stderr, "");
+  assert.equal(document.topic, "price");
+  assert.equal(document.prices.defaults.limit, "0 (all rows returned by Stockbit)");
+  assert.match(document.prices.date_semantics[0], /oldest.*newest/iu);
+  assert.match(document.prices.date_semantics[1], /translates/iu);
+  assert.match(document.prices.response_notes[0], /open.*high.*low.*close/iu);
 });
 
 test("stockbit help broker-summary --json documents broker semantics", async () => {
