@@ -4,5 +4,7 @@ coverage/
 .env
 .env.*
 credentials-stockbit.json
+credentials-stockbit.json.lock/
+.credentials-stockbit.json.*.tmp
 *.log
 .DS_Store

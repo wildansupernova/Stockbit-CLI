@@ -1,6 +1,17 @@
-import { chmod, lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  writeFile,
+} from "node:fs/promises";
+import { randomInt, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import type { ReadStream, WriteStream } from "node:tty";
 
 import { CliError } from "./errors.js";
@@ -11,11 +22,25 @@ const LOCAL_CREDENTIALS_FILENAME = "credentials-stockbit.json";
 
 interface CredentialsFile {
   schemaVersion?: unknown;
+  accounts?: unknown;
+  nextAccountIndex?: unknown;
   accessToken?: unknown;
   refreshToken?: unknown;
   accessExpiresAt?: unknown;
   refreshExpiresAt?: unknown;
   bearerToken?: unknown;
+}
+
+interface StoredCredentialsAccountFile extends CredentialsFile {
+  name?: unknown;
+}
+
+interface StoredCredentialsAccount extends TokenCredentials {
+  name: string;
+}
+
+interface CredentialsStore {
+  accounts: StoredCredentialsAccount[];
 }
 
 interface CredentialStorageValue {
@@ -46,6 +71,11 @@ export interface ResolvedCredentials extends TokenCredentials {
     | "environment"
     | StoredTokenSource;
   credentialsPath?: string;
+  account?: string;
+  accountCount?: number;
+  selectionMode?: "explicit" | "random" | "single";
+  /** @deprecated Random selection replaced round robin. */
+  roundRobin?: boolean;
 }
 
 export interface ResolvedToken {
@@ -60,6 +90,11 @@ export interface ResolvedToken {
 export interface TokenStatus {
   configured: boolean;
   source?: ResolvedToken["source"];
+  account?: string;
+  accountCount?: number;
+  selectionMode?: "explicit" | "random" | "single";
+  /** @deprecated Random selection replaced round robin. */
+  roundRobin?: boolean;
   expiresAt?: string;
   expired?: boolean;
   refreshConfigured?: boolean;
@@ -71,8 +106,45 @@ export type ParsedCredentialStorage = TokenCredentials;
 
 export interface ResolveTokenOptions {
   bearer?: string | undefined;
+  account?: string | undefined;
+  /** @deprecated Selection no longer mutates a persisted cursor. */
+  rotate?: boolean | undefined;
   environment?: NodeJS.ProcessEnv | undefined;
   cwd?: string | undefined;
+}
+
+export interface SavedCredentials {
+  path: string;
+  account: string;
+  accountCount: number;
+}
+
+export interface CredentialAccountStatus {
+  name: string;
+  accessExpiresAt?: string;
+  accessExpired?: boolean;
+  refreshConfigured: boolean;
+  refreshExpiresAt?: string;
+  refreshExpired?: boolean;
+  next: boolean;
+}
+
+export interface CredentialStoreStatus {
+  source: StoredTokenSource;
+  path: string;
+  active: boolean;
+  accountCount: number;
+  selectionMode: "random" | "single";
+  /** @deprecated Random selection has no predictable next account. */
+  nextAccount: string | null;
+  accounts: CredentialAccountStatus[];
+}
+
+export interface RemovedCredentialsAccount {
+  path: string;
+  account: string;
+  removed: boolean;
+  accountCount: number;
 }
 
 function configDirectory(environment: NodeJS.ProcessEnv = process.env): string {
@@ -220,7 +292,9 @@ function normalizeTokenCredentials(credentials: TokenCredentials): TokenCredenti
   return normalized;
 }
 
-function parseCredentialsFile(credentials: CredentialsFile): TokenCredentials | undefined {
+function parseTokenCredentialsFile(
+  credentials: CredentialsFile,
+): TokenCredentials | undefined {
   const accessToken =
     typeof credentials.accessToken === "string"
       ? credentials.accessToken
@@ -245,13 +319,124 @@ function parseCredentialsFile(credentials: CredentialsFile): TokenCredentials | 
   });
 }
 
-async function storedCredentialsAtPath(
+export function normalizeAccountName(value: string): string {
+  const name = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/u.test(name)) {
+    throw new CliError(
+      "INVALID_ACCOUNT",
+      "Account names must be 1-64 characters using letters, numbers, periods, underscores, @, or hyphens.",
+      2,
+    );
+  }
+  return name;
+}
+
+function jwtAccountName(token: string): string | undefined {
+  const payload = token.split(".")[1];
+  if (!payload) {
+    return undefined;
+  }
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      sub?: unknown;
+      data?: { use?: unknown; uid?: unknown };
+    };
+    const candidates = [
+      typeof decoded.data?.use === "string" ? decoded.data.use : undefined,
+      typeof decoded.sub === "string" ? decoded.sub : undefined,
+      typeof decoded.data?.uid === "number" ? `uid-${decoded.data.uid}` : undefined,
+    ];
+    for (const candidate of candidates) {
+      if (!candidate?.trim()) {
+        continue;
+      }
+      try {
+        return normalizeAccountName(candidate);
+      } catch {
+        // Try the next stable identifier from the token.
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function suggestedAccountName(credentials: TokenCredentials): string {
+  const tokenName = jwtAccountName(credentials.accessToken);
+  if (tokenName) {
+    return tokenName;
+  }
+  return "default";
+}
+
+function parseCredentialsStore(credentials: CredentialsFile): CredentialsStore {
+  if (Array.isArray(credentials.accounts)) {
+    const accounts = credentials.accounts.map((value, index) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new CliError(
+          "CREDENTIALS_INVALID",
+          `Stored account ${index + 1} is not an object.`,
+          2,
+        );
+      }
+      const account = value as StoredCredentialsAccountFile;
+      if (typeof account.name !== "string") {
+        throw new CliError(
+          "CREDENTIALS_INVALID",
+          `Stored account ${index + 1} has no valid name.`,
+          2,
+        );
+      }
+      const parsed = parseTokenCredentialsFile(account);
+      if (!parsed) {
+        throw new CliError(
+          "CREDENTIALS_INVALID",
+          `Stored account ${account.name} has no access token.`,
+          2,
+        );
+      }
+      return {
+        name: normalizeAccountName(account.name),
+        ...parsed,
+      };
+    });
+    const names = new Set<string>();
+    for (const account of accounts) {
+      const key = account.name.toLowerCase();
+      if (names.has(key)) {
+        throw new CliError(
+          "CREDENTIALS_INVALID",
+          `The credentials file contains duplicate account name ${account.name}.`,
+          2,
+        );
+      }
+      names.add(key);
+    }
+    return { accounts };
+  }
+
+  const legacy = parseTokenCredentialsFile(credentials);
+  if (!legacy) {
+    return { accounts: [] };
+  }
+  return {
+    accounts: [
+      {
+        name: suggestedAccountName(legacy),
+        ...legacy,
+      },
+    ],
+  };
+}
+
+async function readCredentialsStoreAtPath(
   path: string,
-): Promise<TokenCredentials | undefined> {
+): Promise<CredentialsStore | undefined> {
   try {
     const contents = await readFile(path, "utf8");
     const credentials = JSON.parse(contents) as CredentialsFile;
-    return parseCredentialsFile(credentials);
+    return parseCredentialsStore(credentials);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
@@ -269,16 +454,169 @@ async function storedCredentialsAtPath(
   }
 }
 
+async function pause(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolvePause) => setTimeout(resolvePause, milliseconds));
+}
+
+async function withCredentialsLock<Value>(
+  path: string,
+  operation: () => Promise<Value>,
+): Promise<Value> {
+  const lockPath = `${path}.lock`;
+  let acquired = false;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      acquired = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        const lock = await lstat(lockPath);
+        if (Date.now() - lock.mtimeMs > 30_000) {
+          await rmdir(lockPath);
+          continue;
+        }
+      } catch (lockError) {
+        if ((lockError as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw lockError;
+        }
+      }
+      await pause(20);
+    }
+  }
+  if (!acquired) {
+    throw new CliError(
+      "CREDENTIALS_BUSY",
+      `The credentials file at ${path} is busy; retry the command.`,
+      4,
+    );
+  }
+  try {
+    return await operation();
+  } finally {
+    try {
+      await rmdir(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+}
+
+interface SelectedStoredCredentials {
+  credentials: TokenCredentials;
+  account: string;
+  accountCount: number;
+  selectionMode: "explicit" | "random" | "single";
+}
+
+function selectFromStore(
+  store: CredentialsStore,
+  accountName?: string,
+): StoredCredentialsAccount | undefined {
+  if (store.accounts.length === 0) {
+    return undefined;
+  }
+  const index = accountName
+    ? store.accounts.findIndex(
+        ({ name }) => name.toLowerCase() === accountName.toLowerCase(),
+      )
+    : randomInt(store.accounts.length);
+  if (index < 0) {
+    return undefined;
+  }
+  return store.accounts[index];
+}
+
+async function selectedStoredCredentialsAtPath(
+  path: string,
+  accountName: string | undefined,
+): Promise<SelectedStoredCredentials | undefined> {
+  const store = await readCredentialsStoreAtPath(path);
+  if (!store) {
+    return undefined;
+  }
+  const selected = selectFromStore(store, accountName);
+  if (!selected) {
+    return undefined;
+  }
+  const { name, ...credentials } = selected;
+  return {
+    credentials,
+    account: name,
+    accountCount: store.accounts.length,
+    selectionMode: accountName
+      ? "explicit"
+      : store.accounts.length > 1
+        ? "random"
+        : "single",
+  };
+}
+
 export async function resolveCredentials(
   options: ResolveTokenOptions = {},
 ): Promise<ResolvedCredentials> {
   const environment = options.environment ?? process.env;
   const cwd = options.cwd ?? process.cwd();
+  if (options.bearer?.trim() && options.account?.trim()) {
+    throw new CliError(
+      "INVALID_OPTION",
+      "Use either --bearer or --account, not both.",
+      2,
+    );
+  }
   if (options.bearer?.trim()) {
     return {
       accessToken: normalizeBearerToken(options.bearer),
       source: "command-line",
     };
+  }
+
+  const requestedAccount = options.account?.trim()
+    ? normalizeAccountName(options.account)
+    : undefined;
+  const localPath = localCredentialsPath(cwd);
+  const globalPath = credentialsPath(environment);
+  if (requestedAccount) {
+    const local = await selectedStoredCredentialsAtPath(
+      localPath,
+      requestedAccount,
+    );
+    if (local) {
+      return {
+        ...local.credentials,
+        source: "local-credentials-file",
+        credentialsPath: localPath,
+        account: local.account,
+        accountCount: local.accountCount,
+        selectionMode: local.selectionMode,
+        roundRobin: false,
+      };
+    }
+    const global = await selectedStoredCredentialsAtPath(
+      globalPath,
+      requestedAccount,
+    );
+    if (global) {
+      return {
+        ...global.credentials,
+        source: "credentials-file",
+        credentialsPath: globalPath,
+        account: global.account,
+        accountCount: global.accountCount,
+        selectionMode: global.selectionMode,
+        roundRobin: false,
+      };
+    }
+    throw new CliError(
+      "ACCOUNT_NOT_FOUND",
+      `No stored Stockbit account named ${requestedAccount} was found. Run \`stockbit auth accounts\` to list accounts.`,
+      2,
+    );
   }
 
   const environmentToken = environment[TOKEN_ENVIRONMENT_VARIABLE]?.trim();
@@ -289,23 +627,35 @@ export async function resolveCredentials(
     };
   }
 
-  const localPath = localCredentialsPath(cwd);
-  const localCredentials = await storedCredentialsAtPath(localPath);
+  const localCredentials = await selectedStoredCredentialsAtPath(
+    localPath,
+    undefined,
+  );
   if (localCredentials) {
     return {
-      ...localCredentials,
+      ...localCredentials.credentials,
       source: "local-credentials-file",
       credentialsPath: localPath,
+      account: localCredentials.account,
+      accountCount: localCredentials.accountCount,
+      selectionMode: localCredentials.selectionMode,
+      roundRobin: false,
     };
   }
 
-  const globalPath = credentialsPath(environment);
-  const globalCredentials = await storedCredentialsAtPath(globalPath);
+  const globalCredentials = await selectedStoredCredentialsAtPath(
+    globalPath,
+    undefined,
+  );
   if (globalCredentials) {
     return {
-      ...globalCredentials,
+      ...globalCredentials.credentials,
       source: "credentials-file",
       credentialsPath: globalPath,
+      account: globalCredentials.account,
+      accountCount: globalCredentials.accountCount,
+      selectionMode: globalCredentials.selectionMode,
+      roundRobin: false,
     };
   }
 
@@ -326,18 +676,25 @@ export async function resolveBearerToken(
   };
 }
 
-function serializedCredentials(credentials: TokenCredentials): string {
-  const normalized = normalizeTokenCredentials(credentials);
+function serializedCredentialsStore(store: CredentialsStore): string {
   return `${JSON.stringify({
-    schemaVersion: 1,
-    accessToken: normalized.accessToken,
-    ...(normalized.refreshToken ? { refreshToken: normalized.refreshToken } : {}),
-    ...(normalized.accessExpiresAt
-      ? { accessExpiresAt: normalized.accessExpiresAt }
-      : {}),
-    ...(normalized.refreshExpiresAt
-      ? { refreshExpiresAt: normalized.refreshExpiresAt }
-      : {}),
+    schemaVersion: 2,
+    accounts: store.accounts.map(({ name, ...credentials }) => {
+      const normalized = normalizeTokenCredentials(credentials);
+      return {
+        name,
+        accessToken: normalized.accessToken,
+        ...(normalized.refreshToken
+          ? { refreshToken: normalized.refreshToken }
+          : {}),
+        ...(normalized.accessExpiresAt
+          ? { accessExpiresAt: normalized.accessExpiresAt }
+          : {}),
+        ...(normalized.refreshExpiresAt
+          ? { refreshExpiresAt: normalized.refreshExpiresAt }
+          : {}),
+      };
+    }),
   })}\n`;
 }
 
@@ -358,54 +715,108 @@ async function assertSafeCredentialsPath(path: string): Promise<void> {
   }
 }
 
-async function writeCredentialsFile(
+async function writeCredentialsStoreFile(
   path: string,
-  credentials: TokenCredentials,
+  store: CredentialsStore,
 ): Promise<void> {
   await assertSafeCredentialsPath(path);
-  await writeFile(path, serializedCredentials(credentials), {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await chmod(path, 0o600);
+  const temporaryPath = join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    await writeFile(temporaryPath, serializedCredentialsStore(store), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await chmod(temporaryPath, 0o600);
+    await rename(temporaryPath, path);
+    await chmod(path, 0o600);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
 }
 
-export async function saveCredentials(
+async function upsertCredentialsAtPath(
+  path: string,
+  credentials: TokenCredentials,
+  accountName?: string,
+): Promise<SavedCredentials> {
+  const normalized = normalizeTokenCredentials(credentials);
+  return withCredentialsLock(path, async () => {
+    const store = (await readCredentialsStoreAtPath(path)) ?? {
+      accounts: [],
+    };
+    const name = accountName?.trim()
+      ? normalizeAccountName(accountName)
+      : suggestedAccountName(normalized);
+    const existingIndex = store.accounts.findIndex(
+      (account) => account.name.toLowerCase() === name.toLowerCase(),
+    );
+    const stored: StoredCredentialsAccount = { name, ...normalized };
+    if (existingIndex >= 0) {
+      store.accounts[existingIndex] = stored;
+    } else {
+      store.accounts.push(stored);
+    }
+    await writeCredentialsStoreFile(path, store);
+    return { path, account: name, accountCount: store.accounts.length };
+  });
+}
+
+export async function addCredentials(
   credentials: TokenCredentials,
   environment: NodeJS.ProcessEnv = process.env,
-): Promise<string> {
+  accountName?: string,
+): Promise<SavedCredentials> {
   const directory = configDirectory(environment);
   const path = credentialsPath(environment);
 
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await chmod(directory, 0o700);
-  await writeCredentialsFile(path, credentials);
+  return upsertCredentialsAtPath(path, credentials, accountName);
+}
 
-  return path;
+export async function saveCredentials(
+  credentials: TokenCredentials,
+  environment: NodeJS.ProcessEnv = process.env,
+  accountName?: string,
+): Promise<string> {
+  return (await addCredentials(credentials, environment, accountName)).path;
 }
 
 export async function saveBearerToken(
   value: string,
   environment: NodeJS.ProcessEnv = process.env,
+  accountName?: string,
 ): Promise<string> {
-  return saveCredentials({ accessToken: value }, environment);
+  return saveCredentials({ accessToken: value }, environment, accountName);
+}
+
+export async function addLocalCredentials(
+  credentials: TokenCredentials,
+  cwd: string = process.cwd(),
+  accountName?: string,
+): Promise<SavedCredentials> {
+  const path = localCredentialsPath(cwd);
+  return upsertCredentialsAtPath(path, credentials, accountName);
 }
 
 export async function saveLocalCredentials(
   credentials: TokenCredentials,
   cwd: string = process.cwd(),
+  accountName?: string,
 ): Promise<string> {
-  const path = localCredentialsPath(cwd);
-  await writeCredentialsFile(path, credentials);
-
-  return path;
+  return (await addLocalCredentials(credentials, cwd, accountName)).path;
 }
 
 export async function saveLocalBearerToken(
   value: string,
   cwd: string = process.cwd(),
+  accountName?: string,
 ): Promise<string> {
-  return saveLocalCredentials({ accessToken: value }, cwd);
+  return saveLocalCredentials({ accessToken: value }, cwd, accountName);
 }
 
 export async function persistRefreshedCredentials(
@@ -419,40 +830,143 @@ export async function persistRefreshedCredentials(
       3,
     );
   }
+  if (!resolved.account) {
+    throw new CliError(
+      "REFRESH_NOT_PERSISTABLE",
+      "The selected stored account could not be identified for refresh persistence.",
+      3,
+    );
+  }
   if (resolved.source === "credentials-file") {
     const directory = dirname(resolved.credentialsPath);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
   }
-  await writeCredentialsFile(resolved.credentialsPath, credentials);
+  const path = resolved.credentialsPath;
+  const accountName = resolved.account;
+  const normalized = normalizeTokenCredentials(credentials);
+  await withCredentialsLock(path, async () => {
+    const store = await readCredentialsStoreAtPath(path);
+    if (!store) {
+      throw new CliError(
+        "REFRESH_NOT_PERSISTABLE",
+        "The credentials file disappeared before refreshed credentials could be saved.",
+        3,
+      );
+    }
+    const index = store.accounts.findIndex(
+      ({ name }) => name.toLowerCase() === accountName.toLowerCase(),
+    );
+    if (index < 0) {
+      throw new CliError(
+        "REFRESH_NOT_PERSISTABLE",
+        `Stored account ${accountName} disappeared before refreshed credentials could be saved.`,
+        3,
+      );
+    }
+    store.accounts[index] = { name: accountName, ...normalized };
+    await writeCredentialsStoreFile(path, store);
+  });
+}
+
+async function removeCredentialsAccountAtPath(
+  path: string,
+  accountName: string,
+): Promise<RemovedCredentialsAccount> {
+  const normalizedName = normalizeAccountName(accountName);
+  const initial = await readCredentialsStoreAtPath(path);
+  if (!initial) {
+    return {
+      path,
+      account: normalizedName,
+      removed: false,
+      accountCount: 0,
+    };
+  }
+  return withCredentialsLock(path, async () => {
+    const store = await readCredentialsStoreAtPath(path);
+    if (!store) {
+      return {
+        path,
+        account: normalizedName,
+        removed: false,
+        accountCount: 0,
+      };
+    }
+    const removedIndex = store.accounts.findIndex(
+      ({ name }) => name.toLowerCase() === normalizedName.toLowerCase(),
+    );
+    if (removedIndex < 0) {
+      return {
+        path,
+        account: normalizedName,
+        removed: false,
+        accountCount: store.accounts.length,
+      };
+    }
+
+    const removedName = store.accounts[removedIndex]?.name ?? normalizedName;
+    store.accounts.splice(removedIndex, 1);
+    if (store.accounts.length === 0) {
+      await rm(path, { force: true });
+    } else {
+      await writeCredentialsStoreFile(path, store);
+    }
+    return {
+      path,
+      account: removedName,
+      removed: true,
+      accountCount: store.accounts.length,
+    };
+  });
+}
+
+export async function removeStoredCredentialsAccount(
+  accountName: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<RemovedCredentialsAccount> {
+  return removeCredentialsAccountAtPath(credentialsPath(environment), accountName);
+}
+
+export async function removeLocalStoredCredentialsAccount(
+  accountName: string,
+  cwd: string = process.cwd(),
+): Promise<RemovedCredentialsAccount> {
+  return removeCredentialsAccountAtPath(localCredentialsPath(cwd), accountName);
 }
 
 export async function clearStoredBearerToken(
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<boolean> {
+  return clearCredentialsAtPath(credentialsPath(environment));
+}
+
+async function clearCredentialsAtPath(path: string): Promise<boolean> {
   try {
-    await rm(credentialsPath(environment));
-    return true;
+    await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return false;
     }
     throw error;
   }
+  return withCredentialsLock(path, async () => {
+    try {
+      await rm(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  });
 }
 
 export async function clearLocalStoredBearerToken(
   cwd: string = process.cwd(),
 ): Promise<boolean> {
-  try {
-    await rm(localCredentialsPath(cwd));
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
+  return clearCredentialsAtPath(localCredentialsPath(cwd));
 }
 
 function tokenExpiration(token: string): number | undefined {
@@ -471,39 +985,122 @@ function tokenExpiration(token: string): number | undefined {
   }
 }
 
+function credentialExpiration(
+  token: string,
+  storedExpiration: string | undefined,
+): string | undefined {
+  const expiration = tokenExpiration(token);
+  return expiration !== undefined
+    ? new Date(expiration * 1000).toISOString()
+    : storedExpiration;
+}
+
+export function getResolvedTokenStatus(
+  resolved: ResolvedCredentials,
+): TokenStatus {
+  const accessExpiresAt = credentialExpiration(
+    resolved.accessToken,
+    resolved.accessExpiresAt,
+  );
+  const refreshExpiresAt = resolved.refreshToken
+    ? credentialExpiration(resolved.refreshToken, resolved.refreshExpiresAt)
+    : undefined;
+  const status: TokenStatus = {
+    configured: true,
+    source: resolved.source,
+    refreshConfigured: Boolean(resolved.refreshToken),
+    ...(resolved.account ? { account: resolved.account } : {}),
+    ...(resolved.accountCount !== undefined
+      ? { accountCount: resolved.accountCount }
+      : {}),
+    ...(resolved.selectionMode
+      ? { selectionMode: resolved.selectionMode }
+      : {}),
+    ...(resolved.roundRobin !== undefined
+      ? { roundRobin: resolved.roundRobin }
+      : {}),
+  };
+
+  if (accessExpiresAt) {
+    status.expiresAt = accessExpiresAt;
+    status.expired = Date.parse(accessExpiresAt) <= Date.now();
+  }
+  if (refreshExpiresAt) {
+    status.refreshExpiresAt = refreshExpiresAt;
+    status.refreshExpired = Date.parse(refreshExpiresAt) <= Date.now();
+  }
+  return status;
+}
+
+function accountStatus(
+  account: StoredCredentialsAccount,
+): CredentialAccountStatus {
+  const accessExpiresAt = credentialExpiration(
+    account.accessToken,
+    account.accessExpiresAt,
+  );
+  const refreshExpiresAt = account.refreshToken
+    ? credentialExpiration(account.refreshToken, account.refreshExpiresAt)
+    : undefined;
+  return {
+    name: account.name,
+    refreshConfigured: Boolean(account.refreshToken),
+    next: false,
+    ...(accessExpiresAt
+      ? {
+          accessExpiresAt,
+          accessExpired: Date.parse(accessExpiresAt) <= Date.now(),
+        }
+      : {}),
+    ...(refreshExpiresAt
+      ? {
+          refreshExpiresAt,
+          refreshExpired: Date.parse(refreshExpiresAt) <= Date.now(),
+        }
+      : {}),
+  };
+}
+
+export async function listCredentialStores(
+  options: Pick<ResolveTokenOptions, "environment" | "cwd"> = {},
+): Promise<CredentialStoreStatus[]> {
+  const environment = options.environment ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const candidates: Array<{ source: StoredTokenSource; path: string }> = [
+    { source: "local-credentials-file", path: localCredentialsPath(cwd) },
+    { source: "credentials-file", path: credentialsPath(environment) },
+  ];
+  const stores: CredentialStoreStatus[] = [];
+  for (const candidate of candidates) {
+    const store = await readCredentialsStoreAtPath(candidate.path);
+    if (!store || store.accounts.length === 0) {
+      continue;
+    }
+    stores.push({
+      source: candidate.source,
+      path: candidate.path,
+      active: false,
+      accountCount: store.accounts.length,
+      selectionMode: store.accounts.length > 1 ? "random" : "single",
+      nextAccount: null,
+      accounts: store.accounts.map((account) => accountStatus(account)),
+    });
+  }
+  const activeStore = environment[TOKEN_ENVIRONMENT_VARIABLE]?.trim()
+    ? undefined
+    : stores[0];
+  if (activeStore) {
+    activeStore.active = true;
+  }
+  return stores;
+}
+
 export async function getTokenStatus(
   options: ResolveTokenOptions = {},
 ): Promise<TokenStatus> {
   try {
     const resolved = await resolveCredentials(options);
-    const expiration = tokenExpiration(resolved.accessToken);
-    const accessExpiresAt =
-      expiration !== undefined
-        ? new Date(expiration * 1000).toISOString()
-        : resolved.accessExpiresAt;
-    const refreshExpiration = resolved.refreshToken
-      ? tokenExpiration(resolved.refreshToken)
-      : undefined;
-    const refreshExpiresAt =
-      refreshExpiration !== undefined
-        ? new Date(refreshExpiration * 1000).toISOString()
-        : resolved.refreshExpiresAt;
-    const status: TokenStatus = {
-      configured: true,
-      source: resolved.source,
-      refreshConfigured: Boolean(resolved.refreshToken),
-    };
-
-    if (accessExpiresAt) {
-      status.expiresAt = accessExpiresAt;
-      status.expired = Date.parse(accessExpiresAt) <= Date.now();
-    }
-    if (refreshExpiresAt) {
-      status.refreshExpiresAt = refreshExpiresAt;
-      status.refreshExpired = Date.parse(refreshExpiresAt) <= Date.now();
-    }
-
-    return status;
+    return getResolvedTokenStatus(resolved);
   } catch (error) {
     if (error instanceof CliError && error.code === "AUTH_REQUIRED") {
       return { configured: false };
@@ -574,7 +1171,7 @@ async function readSecretValue(
   input: NodeJS.ReadableStream,
   output: NodeJS.WritableStream,
 ): Promise<string> {
-  const value = process.stdin.isTTY
+  const value = (input as ReadStream).isTTY
     ? await readHiddenValue(prompt, input as ReadStream, output as WriteStream)
     : await readPipedValue(input);
 
@@ -596,4 +1193,57 @@ export async function readCredentialStorage(
   output: NodeJS.WritableStream = process.stdout,
 ): Promise<string> {
   return readSecretValue("credentialStorage value: ", input, output);
+}
+
+function readVisibleLine(
+  prompt: string,
+  input: ReadStream,
+  output: WriteStream,
+): Promise<string> {
+  return new Promise((resolveLine, reject) => {
+    const readline = createInterface({ input, output, terminal: true });
+    let settled = false;
+    const finish = (value: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      readline.close();
+      resolveLine(value.trim());
+    };
+    readline.once("SIGINT", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      readline.close();
+      reject(new CliError("CANCELLED", "Credential import was cancelled.", 130));
+    });
+    readline.question(prompt, finish);
+  });
+}
+
+export async function readAddAnotherAccount(
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stdout,
+): Promise<boolean> {
+  if (!(input as ReadStream).isTTY) {
+    return false;
+  }
+  while (true) {
+    const answer = (
+      await readVisibleLine(
+        "Add another Stockbit account? [y/N]: ",
+        input as ReadStream,
+        output as WriteStream,
+      )
+    ).toLowerCase();
+    if (!answer || answer === "n" || answer === "no") {
+      return false;
+    }
+    if (answer === "y" || answer === "yes") {
+      return true;
+    }
+    output.write("Please answer yes or no.\n");
+  }
 }

@@ -74,9 +74,12 @@ stockbit price --help
 The CLI resolves the access token in this order:
 
 1. `--bearer` for the current invocation
-2. `STOCKBIT_BEARER_TOKEN`
-3. `credentials-stockbit.json` in the current directory
-4. The user-level credentials file
+2. `--account <name>` from a local or global saved credential file
+3. `STOCKBIT_BEARER_TOKEN`
+4. A random account from `credentials-stockbit.json` in the current directory
+5. A random account from the user-level credentials file
+
+`--bearer` and `--account` are mutually exclusive. A local credential file shadows the user-level file for random selection; the CLI does not combine their account lists.
 
 ### Login from credentialStorage
 
@@ -84,12 +87,14 @@ Run:
 
 ```bash
 stockbit auth login
+stockbit auth login --account personal
 ```
 
 To save the credentials for only the current project directory:
 
 ```bash
 stockbit auth login --local
+stockbit auth login --local --account project
 ```
 
 The command will ask you to:
@@ -99,7 +104,9 @@ The command will ask you to:
 3. Select **Application → Local Storage → https://stockbit.com**.
 4. Copy the value named `credentialStorage` and paste it into the local CLI prompt.
 
-The prompt does not echo the value. The CLI URL-decodes it and stores `state.access.token`, `state.refresh.token`, and their expiration metadata. It does not store the raw `credentialStorage` value or embedded user profile.
+The prompt does not echo the value. The CLI URL-decodes it and stores `state.access.token`, `state.refresh.token`, and their expiration metadata. It does not store the raw `credentialStorage` value or embedded user profile. Unless `--account` is supplied, the saved account name comes from the username in the access token. Logging in again with the same name updates that account instead of deleting the others.
+
+After saving each interactive credential, the CLI asks `Add another Stockbit account? [y/N]`. Press Enter or answer no to finish exactly as the original single-account flow did. Answer yes, log in as the next Stockbit account, and paste its `credentialStorage`. When `--account <name>` is supplied, that explicit name applies only to the first import; additional account names are derived from their tokens. Non-interactive piped input remains a single import and receives no follow-up prompt.
 
 Do not paste `credentialStorage`, access tokens, or refresh tokens into chat, issue trackers, or source files.
 
@@ -115,6 +122,33 @@ Credentials are not stored in a temporary directory, where they may disappear un
 
 An operating-system keychain is the preferred future upgrade for stronger at-rest protection; the permission-restricted config file is the portable, dependency-free fallback.
 
+### Multiple accounts and random selection
+
+Each local or user-level credentials file can hold multiple named accounts. Add accounts by running login more than once:
+
+```bash
+stockbit auth login --account personal
+stockbit auth login --account research
+stockbit auth accounts
+stockbit auth accounts --json
+```
+
+When a protected command uses saved credentials without `--account`, it independently chooses one account using Node.js cryptographically secure random selection. No selection cursor or history is persisted, so the same account may be selected for consecutive invocations.
+
+Select one saved account and bypass random selection:
+
+```bash
+stockbit --account research auth status --json
+stockbit --account research fundamental BBCA --report income --statement q2 --view json
+stockbit --account personal price BBCA --from 2026-08-28 --to 2026-08-29 --view csv
+```
+
+`stockbit auth status` makes a protected request and therefore randomly selects an account unless `--account` is given. `stockbit auth accounts` is inspection-only and reports the pool's selection mode. It prints account names and expiration metadata, never access or refresh tokens.
+
+One CLI request uses exactly one selected account. Authentication failures, access denial, HTTP `429`, network errors, and upstream errors are returned immediately; the CLI does not fail over to another account. Use only accounts you own or are authorized to automate, and do not use random selection to evade Stockbit rate limits or access controls.
+
+Existing single-account and round-robin credential files remain readable. A legacy `nextAccountIndex` is ignored and removed the next time the CLI writes that file.
+
 ### Automatic refresh
 
 Credentials imported with `stockbit auth login` enable automatic access-token refresh:
@@ -122,7 +156,7 @@ Credentials imported with `stockbit auth login` enable automatic access-token re
 1. Before a protected request, the CLI refreshes if the access token is expired or expires within 30 seconds.
 2. If expiration is unknown and Stockbit returns HTTP `401`, the CLI refreshes then.
 3. It sends the saved refresh token to `POST /login/refresh`.
-4. It saves the new access token and any rotated refresh token back to the same credentials file.
+4. It saves the new access token and any rotated refresh token back to the same named account in the same credentials file.
 5. It retries the original request once.
 
 If Stockbit rejects the refresh token, the CLI stops with `REFRESH_FAILED` and asks for `stockbit auth login` again. It never retries refresh indefinitely.
@@ -135,6 +169,7 @@ Store an access token interactively without displaying it:
 
 ```bash
 stockbit auth set-token
+stockbit auth set-token --account access-only
 stockbit auth status
 ```
 
@@ -142,6 +177,7 @@ To store a directly supplied access token for the current directory:
 
 ```bash
 stockbit auth set-token --local
+stockbit auth set-token --local --account access-only
 ```
 
 For ephemeral environments, provide the token through an environment variable:
@@ -163,7 +199,15 @@ Avoid `--bearer` when possible because command-line arguments may be retained in
 
 `stockbit auth status` refreshes when needed, validates authentication through Stockbit's user endpoint, and returns the current profile plus non-secret expiration and refresh-status metadata. It never prints either token.
 
-Remove the stored credentials:
+Remove one named account while preserving the others:
+
+```bash
+stockbit auth remove research
+stockbit auth remove project --local
+stockbit auth clear --account research
+```
+
+Remove an entire credential file and every account in it:
 
 ```bash
 stockbit auth clear

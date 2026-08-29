@@ -21,10 +21,14 @@ test("builds a complete machine-readable agent reference", () => {
   assert.ok(document.commands.some(({ command }) => command.includes("auth login")));
   assert.deepEqual(document.authentication.resolution_order, [
     "--bearer <token>",
+    "--account <name> from a local or global credentials file",
     "STOCKBIT_BEARER_TOKEN",
-    "./credentials-stockbit.json",
-    "~/.config/stockbit-cli/credentials.json",
+    "a random account from ./credentials-stockbit.json",
+    "a random account from ~/.config/stockbit-cli/credentials.json",
   ]);
+  assert.match(document.authentication.multi_account[1], /random/iu);
+  assert.ok(document.commands.some(({ command }) => command.includes("auth accounts")));
+  assert.match(document.authentication.login_steps[4], /another account/iu);
   assert.deepEqual(
     document.formats.map(({ name }) => name),
     ["json", "raw", "csv"],

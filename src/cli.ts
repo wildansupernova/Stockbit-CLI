@@ -12,18 +12,24 @@ import {
   validateBrokerDateRange,
 } from "./broker-summary.js";
 import {
+  addCredentials,
+  addLocalCredentials,
   clearLocalStoredBearerToken,
   clearStoredBearerToken,
   credentialsPath,
-  getTokenStatus,
+  getResolvedTokenStatus,
+  listCredentialStores,
   localCredentialsPath,
+  removeLocalStoredCredentialsAccount,
+  removeStoredCredentialsAccount,
+  readAddAnotherAccount,
   readBearerToken,
   readCredentialStorage,
   resolveCredentials,
   persistRefreshedCredentials,
-  saveCredentials,
-  saveLocalCredentials,
   parseCredentialStorage,
+  type ResolvedCredentials,
+  type SavedCredentials,
   type TokenCredentials,
 } from "./auth.js";
 import { CliError } from "./errors.js";
@@ -56,6 +62,10 @@ program
     "--bearer <token>",
     "Use a bearer token for this invocation instead of environment or saved credentials.",
   )
+  .option(
+    "--account <name>",
+    "Select a saved account, or name one for auth login/set-token; otherwise selection is random.",
+  )
   .showHelpAfterError();
 
 const auth = program.command("auth").description("Manage Stockbit authentication credentials.");
@@ -63,21 +73,39 @@ const auth = program.command("auth").description("Manage Stockbit authentication
 async function saveToken(
   credentials: TokenCredentials,
   local: boolean | undefined,
-): Promise<string> {
-  const path = local
-    ? await saveLocalCredentials(credentials)
-    : await saveCredentials(credentials);
-  if (local) {
+  account: string | undefined,
+  warnAboutLocalFile = true,
+): Promise<SavedCredentials> {
+  const saved = local
+    ? await addLocalCredentials(credentials, process.cwd(), account)
+    : await addCredentials(credentials, process.env, account);
+  if (local && warnAboutLocalFile) {
     process.stdout.write(
       "Warning: add credentials-stockbit.json to this project's .gitignore.\n",
     );
   }
-  return path;
+  return saved;
 }
 
-async function authenticatedClient(bearer: string | undefined): Promise<StockbitClient> {
-  const credentials = await resolveCredentials({ bearer });
-  return new StockbitClient({
+interface AuthenticationOptions {
+  bearer?: string | undefined;
+  account?: string | undefined;
+}
+
+interface AuthenticatedSession {
+  client: StockbitClient;
+  credentials: () => ResolvedCredentials;
+}
+
+function authenticationOptions(): AuthenticationOptions {
+  return program.opts<{ bearer?: string; account?: string }>();
+}
+
+async function authenticatedSession(
+  options: AuthenticationOptions,
+): Promise<AuthenticatedSession> {
+  let credentials = await resolveCredentials(options);
+  const client = new StockbitClient({
     token: credentials.accessToken,
     ...(credentials.refreshToken ? { refreshToken: credentials.refreshToken } : {}),
     ...(credentials.accessExpiresAt
@@ -85,18 +113,27 @@ async function authenticatedClient(bearer: string | undefined): Promise<Stockbit
       : {}),
     ...(credentials.credentialsPath
       ? {
-          onCredentialsRefreshed: async (refreshed) =>
-            persistRefreshedCredentials(credentials, refreshed),
+          onCredentialsRefreshed: async (refreshed) => {
+            await persistRefreshedCredentials(credentials, refreshed);
+            credentials = { ...credentials, ...refreshed };
+          },
         }
       : {}),
   });
+  return { client, credentials: () => credentials };
+}
+
+async function authenticatedClient(
+  options: AuthenticationOptions,
+): Promise<StockbitClient> {
+  return (await authenticatedSession(options)).client;
 }
 
 auth
   .command("login")
-  .description("Import access and refresh tokens from Stockbit credentialStorage.")
+  .description("Import one or more accounts from Stockbit credentialStorage.")
   .option("--local", "Save credentials-stockbit.json in the current directory.")
-  .action(async (options: { local?: boolean }) => {
+  .action(async (options: { local?: boolean }, command: Command) => {
     process.stdout.write(
       [
         "1. Log in at https://stockbit.com in your browser.",
@@ -106,22 +143,49 @@ auth
         "",
       ].join("\n"),
     );
-    const value = await readCredentialStorage();
-    const parsed = parseCredentialStorage(value);
-    const path = await saveToken(parsed, options.local);
-    process.stdout.write(`Credentials saved to ${path} with user-only permissions.\n`);
-    if (parsed.accessExpiresAt) {
-      process.stdout.write(`Access token expires at: ${parsed.accessExpiresAt}\n`);
-    }
-    if (parsed.refreshToken) {
-      process.stdout.write("Automatic access-token refresh is enabled.\n");
-    } else {
-      process.stdout.write(
-        "No refresh token was found; run auth login again when the access token expires.\n",
+    const requestedAccount = command.optsWithGlobals<AuthenticationOptions>().account;
+    let importedAccounts = 0;
+    while (true) {
+      const value = await readCredentialStorage();
+      const parsed = parseCredentialStorage(value);
+      const saved = await saveToken(
+        parsed,
+        options.local,
+        importedAccounts === 0 ? requestedAccount : undefined,
+        importedAccounts === 0,
       );
+      importedAccounts += 1;
+      process.stdout.write(
+        `Credentials saved to ${saved.path} as account ${saved.account} with user-only permissions.\n`,
+      );
+      process.stdout.write(`Stored accounts in this file: ${saved.accountCount}.\n`);
+      if (parsed.accessExpiresAt) {
+        process.stdout.write(`Access token expires at: ${parsed.accessExpiresAt}\n`);
+      }
+      if (parsed.refreshToken) {
+        process.stdout.write("Automatic access-token refresh is enabled.\n");
+      } else {
+        process.stdout.write(
+          "No refresh token was found; run auth login again when the access token expires.\n",
+        );
+      }
+      if (parsed.refreshExpiresAt) {
+        process.stdout.write(`Refresh token expires at: ${parsed.refreshExpiresAt}\n`);
+      }
+      if (!(await readAddAnotherAccount())) {
+        break;
+      }
+      process.stdout.write(
+        "Log in as the next Stockbit account, then copy and paste its credentialStorage value.\n",
+      );
+      if (requestedAccount && importedAccounts === 1) {
+        process.stdout.write(
+          "The explicit --account name applied to the first import; the next name will come from its token.\n",
+        );
+      }
     }
-    if (parsed.refreshExpiresAt) {
-      process.stdout.write(`Refresh token expires at: ${parsed.refreshExpiresAt}\n`);
+    if (importedAccounts > 1) {
+      process.stdout.write(`Imported ${importedAccounts} accounts.\n`);
     }
   });
 
@@ -129,10 +193,80 @@ auth
   .command("set-token")
   .description("Store an access token without automatic refresh.")
   .option("--local", "Save credentials-stockbit.json in the current directory.")
-  .action(async (options: { local?: boolean }) => {
+  .action(async (options: { local?: boolean }, command: Command) => {
     const token = await readBearerToken();
-    const path = await saveToken({ accessToken: token }, options.local);
-    process.stdout.write(`Bearer token saved to ${path} with user-only permissions.\n`);
+    const account = command.optsWithGlobals<AuthenticationOptions>().account;
+    const saved = await saveToken(
+      { accessToken: token },
+      options.local,
+      account,
+    );
+    process.stdout.write(
+      `Bearer token saved to ${saved.path} as account ${saved.account} with user-only permissions.\n`,
+    );
+    process.stdout.write(`Stored accounts in this file: ${saved.accountCount}.\n`);
+  });
+
+auth
+  .command("accounts")
+  .alias("list")
+  .description("List saved accounts and their selection mode without tokens.")
+  .option("--json", "Print machine-readable JSON.")
+  .action(async (options: { json?: boolean }) => {
+    const stores = await listCredentialStores();
+    if (options.json) {
+      process.stdout.write(
+        `${JSON.stringify(
+          {
+            schema_version: "1",
+            active_source: stores.find(({ active }) => active)?.source ?? null,
+            stores: stores.map((store) => ({
+              source: store.source,
+              path: store.path,
+              active: store.active,
+              account_count: store.accountCount,
+              selection_mode: store.selectionMode,
+              // Kept for consumers of the original round-robin schema.
+              next_account: store.nextAccount,
+              accounts: store.accounts.map((account) => ({
+                name: account.name,
+                next: account.next,
+                ...(account.accessExpiresAt
+                  ? { access_expires_at: account.accessExpiresAt }
+                  : {}),
+                ...(account.accessExpired !== undefined
+                  ? { access_expired: account.accessExpired }
+                  : {}),
+                refresh_configured: account.refreshConfigured,
+                ...(account.refreshExpiresAt
+                  ? { refresh_expires_at: account.refreshExpiresAt }
+                  : {}),
+                ...(account.refreshExpired !== undefined
+                  ? { refresh_expired: account.refreshExpired }
+                  : {}),
+              })),
+            })),
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return;
+    }
+    if (stores.length === 0) {
+      process.stdout.write("No saved Stockbit accounts were found.\n");
+      return;
+    }
+    for (const store of stores) {
+      process.stdout.write(
+        `${store.active ? "Active" : "Inactive"} ${store.source} (${store.selectionMode} selection): ${store.path}\n`,
+      );
+      for (const account of store.accounts) {
+        process.stdout.write(
+          `  - ${account.name}${account.refreshConfigured ? " (refresh enabled)" : ""}\n`,
+        );
+      }
+    }
   });
 
 auth
@@ -140,27 +274,45 @@ auth
   .description("Validate authentication, refreshing if needed, and return the profile.")
   .option("--json", "Print machine-readable JSON.")
   .action(async (options: { json?: boolean }, command: Command) => {
-    const bearer = command.optsWithGlobals<{ bearer?: string }>().bearer;
-    const status = await getTokenStatus({ bearer });
-    if (options.json) {
-      if (!status.configured) {
-        process.stdout.write(
-          `${JSON.stringify({ configured: false, authenticated: false }, null, 2)}\n`,
-        );
+    const selection = command.optsWithGlobals<AuthenticationOptions>();
+    let session: AuthenticatedSession;
+    try {
+      session = await authenticatedSession(selection);
+    } catch (error) {
+      if (error instanceof CliError && error.code === "AUTH_REQUIRED") {
+        if (options.json) {
+          process.stdout.write(
+            `${JSON.stringify({ configured: false, authenticated: false }, null, 2)}\n`,
+          );
+          return;
+        }
+        process.stdout.write("No bearer token is configured.\n");
         return;
       }
-    } else if (!status.configured) {
-      process.stdout.write("No bearer token is configured.\n");
-      return;
+      throw error;
     }
 
-    const profile = await (await authenticatedClient(bearer)).userProfile();
-    const currentStatus = await getTokenStatus({ bearer });
+    const profile = await session.client.userProfile();
+    const currentStatus = getResolvedTokenStatus(session.credentials());
     const result = {
       schema_version: "1",
       configured: true,
       authenticated: true,
       source: currentStatus.source,
+      ...(currentStatus.account ? { account: currentStatus.account } : {}),
+      ...(currentStatus.accountCount !== undefined
+        ? { account_count: currentStatus.accountCount }
+        : {}),
+      ...(currentStatus.selectionMode
+        ? {
+            selection_mode: currentStatus.selectionMode,
+            random_selection: currentStatus.selectionMode === "random",
+          }
+        : {}),
+      // Kept for consumers of the original round-robin status schema.
+      ...(currentStatus.roundRobin !== undefined
+        ? { round_robin: currentStatus.roundRobin }
+        : {}),
       ...(currentStatus.expiresAt ? { expires_at: currentStatus.expiresAt } : {}),
       ...(currentStatus.expired !== undefined ? { expired: currentStatus.expired } : {}),
       refresh_configured: currentStatus.refreshConfigured ?? false,
@@ -175,7 +327,12 @@ auth
     };
 
     if (!options.json) {
-      process.stdout.write(`Authenticated via ${currentStatus.source}.\n`);
+      process.stdout.write(
+        `Authenticated via ${currentStatus.source}${currentStatus.account ? ` (account ${currentStatus.account})` : ""}.\n`,
+      );
+      if (currentStatus.selectionMode) {
+        process.stdout.write(`Account selection: ${currentStatus.selectionMode}.\n`);
+      }
       if (currentStatus.expiresAt) {
         process.stdout.write(
           `Access token expires at: ${currentStatus.expiresAt}${currentStatus.expired ? " (expired)" : ""}\n`,
@@ -189,10 +346,38 @@ auth
   });
 
 auth
+  .command("remove")
+  .description("Remove one named account from a saved credential file.")
+  .argument("<account>", "Saved account name.")
+  .option("--local", "Remove it from credentials-stockbit.json in this directory.")
+  .action(async (account: string, options: { local?: boolean }) => {
+    const result = options.local
+      ? await removeLocalStoredCredentialsAccount(account)
+      : await removeStoredCredentialsAccount(account);
+    process.stdout.write(
+      result.removed
+        ? `Removed account ${result.account} from ${result.path}. ${result.accountCount} account(s) remain.\n`
+        : `No account named ${result.account} was found at ${result.path}.\n`,
+    );
+  });
+
+auth
   .command("clear")
   .description("Remove stored access and refresh credentials.")
   .option("--local", "Remove credentials-stockbit.json from the current directory.")
-  .action(async (options: { local?: boolean }) => {
+  .action(async (options: { local?: boolean }, command: Command) => {
+    const account = command.optsWithGlobals<AuthenticationOptions>().account;
+    if (account) {
+      const result = options.local
+        ? await removeLocalStoredCredentialsAccount(account)
+        : await removeStoredCredentialsAccount(account);
+      process.stdout.write(
+        result.removed
+          ? `Removed account ${result.account} from ${result.path}. ${result.accountCount} account(s) remain.\n`
+          : `No account named ${result.account} was found at ${result.path}.\n`,
+      );
+      return;
+    }
     const removed = options.local
       ? await clearLocalStoredBearerToken()
       : await clearStoredBearerToken();
@@ -236,8 +421,7 @@ program
         compact?: boolean;
       },
     ) => {
-      const bearer = program.opts<{ bearer?: string }>().bearer;
-      const client = await authenticatedClient(bearer);
+      const client = await authenticatedClient(authenticationOptions());
       const view = parseFundamentalView(options.view);
       const result = await client.fundamental({
         symbol,
@@ -288,8 +472,7 @@ program
       const from = parseBrokerDate(options.from, "from");
       const to = parseBrokerDate(options.to ?? options.from, "to");
       validateBrokerDateRange(from, to);
-      const bearer = program.opts<{ bearer?: string }>().bearer;
-      const client = await authenticatedClient(bearer);
+      const client = await authenticatedClient(authenticationOptions());
       const result = await client.brokerSummary({
         symbol,
         from,
@@ -335,8 +518,7 @@ program
       const from = parsePriceDate(options.from, "from");
       const to = parsePriceDate(options.to, "to");
       validatePriceDateRange(from, to);
-      const bearer = program.opts<{ bearer?: string }>().bearer;
-      const client = await authenticatedClient(bearer);
+      const client = await authenticatedClient(authenticationOptions());
       const result = await client.price({
         symbol,
         from,

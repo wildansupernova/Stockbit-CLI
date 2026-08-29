@@ -44,6 +44,7 @@ export interface AgentHelpDocument {
     resolution_order: string[];
     storage: Record<string, string>;
     login_steps: string[];
+    multi_account: string[];
     automatic_refresh: string[];
     safety: string[];
   };
@@ -103,20 +104,28 @@ const TOPIC_ALIASES: Readonly<Record<string, HelpTopic>> = {
 
 const COMMANDS: HelpCommand[] = [
   {
-    command: "stockbit auth login [--local]",
-    purpose: "Import access and refresh tokens from an interactively pasted credentialStorage value.",
+    command: "stockbit auth login [--local] [--account <name>]",
+    purpose: "Interactively add or update one or more accounts from credentialStorage values.",
   },
   {
-    command: "stockbit auth set-token [--local]",
-    purpose: "Interactively store an access token without echoing it; automatic refresh is unavailable.",
+    command: "stockbit auth set-token [--local] [--account <name>]",
+    purpose: "Add or update a named access-only account without echoing the token.",
   },
   {
-    command: "stockbit auth status [--json] [--bearer <token>]",
-    purpose: "Validate authentication and return the current Stockbit profile.",
+    command: "stockbit auth accounts [--json]",
+    purpose: "List account names, expiration status, stores, and random-selection mode without exposing tokens.",
   },
   {
-    command: "stockbit auth clear [--local]",
-    purpose: "Remove the global or current-directory credential file.",
+    command: "stockbit auth status [--json] [--bearer <token> | --account <name>]",
+    purpose: "Select one account, validate authentication, and return its Stockbit profile.",
+  },
+  {
+    command: "stockbit auth remove <account> [--local]",
+    purpose: "Remove one named account from the global or current-directory credential file.",
+  },
+  {
+    command: "stockbit auth clear [--local] [--account <name>]",
+    purpose: "Remove one selected account, or the entire credential file when no account is selected.",
   },
   {
     command: "stockbit fundamental <symbol> [options]",
@@ -128,6 +137,7 @@ const COMMANDS: HelpCommand[] = [
       "--view <json|raw|csv>",
       "--compact",
       "--bearer <token> (global option)",
+      "--account <name> (global option; bypasses random selection)",
     ],
   },
   {
@@ -143,6 +153,7 @@ const COMMANDS: HelpCommand[] = [
       "--view <json|raw|csv>",
       "--compact",
       "--bearer <token> (global option)",
+      "--account <name> (global option; bypasses random selection)",
     ],
   },
   {
@@ -155,6 +166,7 @@ const COMMANDS: HelpCommand[] = [
       "--view <json|raw|csv>",
       "--compact",
       "--bearer <token> (global option)",
+      "--account <name> (global option; bypasses random selection)",
     ],
   },
   {
@@ -232,6 +244,7 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
     },
     agent_guidance: [
       "Run `stockbit auth status --json` before a protected request when authentication is uncertain.",
+      "Use `stockbit auth accounts --json` to inspect account names and selection mode without exposing credentials.",
       "Prefer `--view json` for normalized data, financial reasoning, and exact metric lookup.",
       "Use `--view csv` for tabular export and `--view raw` only to inspect an unchanged upstream payload.",
       "Treat raw, IDR, and USD numeric fields as decimal strings to avoid precision loss.",
@@ -250,9 +263,10 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
     document.authentication = {
       resolution_order: [
         "--bearer <token>",
+        "--account <name> from a local or global credentials file",
         "STOCKBIT_BEARER_TOKEN",
-        "./credentials-stockbit.json",
-        "~/.config/stockbit-cli/credentials.json",
+        "a random account from ./credentials-stockbit.json",
+        "a random account from ~/.config/stockbit-cli/credentials.json",
       ],
       storage: {
         global: "~/.config/stockbit-cli/credentials.json (directory 0700, file 0600)",
@@ -262,13 +276,27 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
         "Log in to https://stockbit.com.",
         "Open Developer Tools > Application > Local Storage > https://stockbit.com.",
         "Copy credentialStorage and paste it into `stockbit auth login`.",
+        "The account name defaults to the username inside the access token; pass `--account <name>` to choose it explicitly.",
+        "After each interactive import, answer yes to import another account or press Enter/answer no to finish.",
+        "When `--account <name>` is used with multiple imports, it names only the first account; later names come from their tokens.",
+        "Non-interactive piped input remains a single import and does not prompt for another account.",
         "The CLI stores only the access and refresh tokens plus expiration metadata, not the full credentialStorage value or user profile.",
+      ],
+      multi_account: [
+        "Each credential file can contain multiple named accounts; a login with the same name updates only that account.",
+        "Each protected CLI invocation independently chooses one saved account using cryptographically secure random selection.",
+        "Account selection is not persisted; legacy nextAccountIndex values are ignored and removed on the next credential write.",
+        "The local credential file shadows the global file; accounts are not mixed across the two stores during random selection.",
+        "Pass global `--account <name>` to select that saved account and bypass random selection.",
+        "`stockbit auth status` randomly selects an account because it makes an authenticated request; `stockbit auth accounts` only inspects the pool.",
+        "A failed, denied, or rate-limited request is not retried with another account.",
       ],
       automatic_refresh: [
         "Available only when auth login imported a refresh token into a local or global credentials file.",
         "Refresh before a request when the access token is expired or within 30 seconds of expiration.",
         "Refresh after the first HTTP 401 response when expiration was not known in advance.",
         "Persist access and refresh token rotation, then retry the original request once.",
+        "Persist refreshed tokens only into the selected named account without changing other accounts.",
         "If Stockbit rejects the refresh token, stop and require `stockbit auth login` again.",
         "--bearer, STOCKBIT_BEARER_TOKEN, and auth set-token are access-only and do not borrow a stored refresh token.",
       ],
@@ -276,6 +304,7 @@ export function getAgentHelp(topic: HelpTopic = "all"): AgentHelpDocument {
         "Prefer saved credentials or STOCKBIT_BEARER_TOKEN over --bearer because shell history may retain arguments.",
         "A refresh token is long-lived and sensitive; protect the credentials file and revoke exposed tokens immediately.",
         "Do not store credentials in temporary, shared, or version-controlled locations.",
+        "Use only accounts you own or are authorized to automate; random selection must not be used to evade Stockbit limits or controls.",
       ],
     };
   }
@@ -412,6 +441,7 @@ export function renderAgentHelp(document: AgentHelpDocument): string {
     lines.push(
       ...renderList("Authentication precedence", document.authentication.resolution_order),
       ...renderList("Login", document.authentication.login_steps),
+      ...renderList("Multiple accounts and random selection", document.authentication.multi_account),
       ...renderList("Automatic refresh", document.authentication.automatic_refresh),
       ...renderList("Credential safety", document.authentication.safety),
     );
